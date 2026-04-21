@@ -278,6 +278,7 @@
           <button data-action="find" class="primary wide" data-testid="btn-find">Achar jogo (canvas)</button>
           <button data-action="calibrate" data-testid="btn-calibrate">Calibrar</button>
           <button data-action="detect" data-testid="btn-detect">Detectar bolas</button>
+          <button data-action="pause" class="primary wide" data-testid="btn-pause">Pausar detecção (sem flicker)</button>
           <button data-action="cue" data-testid="btn-pick-cue">Escolher branca</button>
           <button data-action="target" data-testid="btn-pick-target">Escolher alvo</button>
           <button data-action="pocket" data-testid="btn-pick-pocket">Escolher caçapa</button>
@@ -383,6 +384,20 @@
   /* ------------------------------------------------------------------ */
   function handleAction(action) {
     switch (action) {
+      case 'pause': {
+        if (state._detectInterval) {
+          stopContinuousDetection();
+          const btn = state.panel && state.panel.querySelector('[data-testid="btn-pause"]');
+          if (btn) btn.textContent = 'Retomar detecção';
+          setHint('Deteccao pausada (sem flicker). A mira atual fica congelada. Clique "Retomar deteccao" para seguir.');
+        } else {
+          startContinuousDetection();
+          const btn = state.panel && state.panel.querySelector('[data-testid="btn-pause"]');
+          if (btn) btn.textContent = 'Pausar detecção (sem flicker)';
+          setHint('Deteccao retomada. Atualiza cada 1.5s.');
+        }
+        break;
+      }
       case 'find': {
         const ok = tryMountOverlay(false);
         if (ok) {
@@ -624,10 +639,11 @@
     // IMPORTANT: the screenshot captures our own overlay too, which would
     // show up as white/colored blobs (pocket markers, aim ring, detection
     // highlights) and confuse the ball detection. So we hide the overlay
-    // briefly, wait two frames, capture, then restore visibility.
+    // for ONE frame, capture, then restore. Interval is set to 1500ms so
+    // the user only sees a ~16ms blink roughly once per 1.5s.
     const wasVisible = state.overlay && state.overlay.style.visibility !== 'hidden';
     if (wasVisible) state.overlay.style.visibility = 'hidden';
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    await new Promise((r) => requestAnimationFrame(r));
 
     const resp = await new Promise((resolve) => {
       try {
@@ -731,11 +747,25 @@
       }
     }
 
+    // Erode by 1 pixel to break apart touching balls (common after rack).
+    // A pixel keeps value 1 only if all 4-neighbours are also 1.
+    const eroded = new Uint8Array(W * H);
+    for (let y = minY + 1; y <= maxY - 1; y++) {
+      for (let x = minX + 1; x <= maxX - 1; x++) {
+        const i = y * W + x;
+        if (!mask[i]) continue;
+        if (mask[i - 1] && mask[i + 1] && mask[i - W] && mask[i + W]) {
+          eroded[i] = 1;
+        }
+      }
+    }
+    const detectMask = eroded;
+
     // Connected components (BFS)
     const visited = new Uint8Array(W * H);
     const balls = [];
     const R0 = state.ballRadius;
-    const minArea = Math.PI * (R0 * 0.45) ** 2;
+    const minArea = Math.PI * (R0 * 0.35) ** 2;
     const maxArea = Math.PI * (R0 * 1.9) ** 2;
     const qx = new Int32Array(W * H);
     const qy = new Int32Array(W * H);
@@ -743,7 +773,7 @@
     for (let y = minY; y <= maxY; y++) {
       for (let x = minX; x <= maxX; x++) {
         const idx = y * W + x;
-        if (!mask[idx] || visited[idx]) continue;
+        if (!detectMask[idx] || visited[idx]) continue;
         let head = 0, tail = 0;
         qx[tail] = x; qy[tail] = y; tail++;
         visited[idx] = 1;
@@ -761,34 +791,33 @@
           rSum += data[pi]; gSum += data[pi + 1]; bSum += data[pi + 2];
           if (cx2 > minX) {
             const ni = cy2 * W + (cx2 - 1);
-            if (mask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2 - 1; qy[tail] = cy2; tail++; }
+            if (detectMask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2 - 1; qy[tail] = cy2; tail++; }
           }
           if (cx2 < maxX) {
             const ni = cy2 * W + (cx2 + 1);
-            if (mask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2 + 1; qy[tail] = cy2; tail++; }
+            if (detectMask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2 + 1; qy[tail] = cy2; tail++; }
           }
           if (cy2 > minY) {
             const ni = (cy2 - 1) * W + cx2;
-            if (mask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2; qy[tail] = cy2 - 1; tail++; }
+            if (detectMask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2; qy[tail] = cy2 - 1; tail++; }
           }
           if (cy2 < maxY) {
             const ni = (cy2 + 1) * W + cx2;
-            if (mask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2; qy[tail] = cy2 + 1; tail++; }
+            if (detectMask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2; qy[tail] = cy2 + 1; tail++; }
           }
         }
         if (area < minArea || area > maxArea) continue;
         const w = bbR - bbL + 1, h = bbB - bbT + 1;
         if (w === 0 || h === 0) continue;
         const aspect = Math.max(w / h, h / w);
-        if (aspect > 1.7) continue; // rejects cue stick and elongated noise
-        // circularity: fill ratio of bounding circle
+        if (aspect > 2.0) continue; // rejects cue stick
         const rBB = Math.max(w, h) / 2;
         const fill = area / (Math.PI * rBB * rBB);
-        if (fill < 0.45) continue; // rejects C-shapes / holes
+        if (fill < 0.35) continue; // rejects very non-circular blobs
         balls.push({
           x: sx2 / area,
           y: sy2 / area,
-          r: rBB,
+          r: rBB + 1, // +1 to compensate for the erosion we did
           area,
           color: { r: rSum / area, g: gSum / area, b: bSum / area },
         });
@@ -1039,7 +1068,7 @@
         state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
         updateStatusLine();
       }
-    }, 700); // 700ms is safe under captureVisibleTab rate limit (~2/sec)
+    }, 1500); // 1500ms interval keeps flicker brief (~16ms every 1.5s = ~1% hidden)
   }
   function stopContinuousDetection() {
     if (state._detectInterval) {
