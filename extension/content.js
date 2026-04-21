@@ -998,27 +998,24 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Cue stick detection (Angular Histogram)                            */
+  /* Cue stick detection (Ray casting with continuity scoring)          */
   /*                                                                    */
-  /* Per-frame pipeline (robust to ball halos + UI clutter):            */
-  /*  1. Collect non-felt pixels around the cue ball (inside polygon +  */
-  /*     rail margin).                                                  */
-  /*  2. Aggressive ball masking (1.9 R) so stray pixels from nearby    */
-  /*     striped/colored balls do not contaminate the vote.             */
-  /*  3. For every surviving pixel compute its ANGLE relative to the    */
-  /*     cue ball and add its DISTANCE to the angle-bin. Far pixels     */
-  /*     (definitively stick, not ball rim) weigh more than near ones.  */
-  /*  4. Smooth the 72-bin histogram (5 deg each) with a 5-tap kernel,  */
-  /*     find the peak bin — that is the butt direction.                */
-  /*  5. Safety checks: clear peak vs. noise floor AND the peak bin     */
-  /*     must contain at least one pixel at distance >= 3R (real stick).*/
-  /*  6. Shot direction = opposite of butt direction.                   */
+  /* For each of 120 candidate angles (3 deg resolution) we cast a ray  */
+  /* outward from the cue ball and walk it pixel-by-pixel. A pixel is   */
+  /* a "stick hit" if it passes the cue-stick filters (not felt, bright */
+  /* enough, not on another ball, not in a pocket, inside the table +   */
+  /* rail margin). The SCORE of each angle is the length of the LONGEST */
+  /* CONTIGUOUS streak of stick hits along that ray.                    */
   /*                                                                    */
-  /* Why this is more robust than PCA: ball-halo pixels scatter across  */
-  /* many angles around the cue ball, so they spread across bins; the   */
-  /* actual cue stick pixels all sit in 1-2 adjacent bins so they       */
-  /* dominate the peak. PCA can be flipped 90° when a large ball        */
-  /* cluster has more pixels than the stick.                            */
+  /* Why this beats histograms/PCA:                                     */
+  /* - A cue stick is a continuous line, so a ray along it hits many    */
+  /*   pixels in sequence -> long streak (~150px).                      */
+  /* - A ball halo is an arc; a ray crosses it for only 2-6 px -> short */
+  /*   streak.                                                          */
+  /* - A pocket is a small spot; ~5 px streak.                          */
+  /* - Scoreboard/chat never survive ray pokes because of brightness +  */
+  /*   rail-margin filters.                                             */
+  /* The correct stick wins by orders of magnitude.                     */
   /* ------------------------------------------------------------------ */
   function distToPolySq(x, y, poly) {
     let minD2 = Infinity;
@@ -1042,151 +1039,149 @@
   function detectCueStick(data, W, H, balls) {
     const cue = state.cueBall;
     const R = state.ballRadius;
-    const searchR = Math.max(180, R * 14);
-    const excludeR = R * 1.7;
-    // Bumped from 1.3 to 1.9: aggressive ball masking so adjacent ball
-    // rims don't contribute noise pixels that skew the direction vote.
-    const ballExcludeR = R * 1.9;
+    const MAX_R = Math.max(200, R * 16);
+    const MIN_R = R * 1.15;
+    const STEP = 1.5; // px per ray step
     const RAIL_MARGIN = Math.max(50, Math.round(R * 4));
     const RAIL_MARGIN2 = RAIL_MARGIN * RAIL_MARGIN;
+    const BALL_EXCLUDE_R2 = (R * 1.4) * (R * 1.4);
+    const POCKET_EXCLUDE_R = R * 1.2; // ignore pixels inside pockets
+    const POCKET_EXCLUDE_R2 = POCKET_EXCLUDE_R * POCKET_EXCLUDE_R;
 
-    const xMin = Math.max(0, Math.floor(cue.x - searchR));
-    const xMax = Math.min(W - 1, Math.ceil(cue.x + searchR));
-    const yMin = Math.max(0, Math.floor(cue.y - searchR));
-    const yMax = Math.min(H - 1, Math.ceil(cue.y + searchR));
-
-    const ballsArr = balls;
     const poly = state.corners;
     const havePoly = poly.length === 4;
+    const ballsArr = balls;
+    const pocketsArr = state.pockets || [];
 
-    const N_BINS = 72;       // 5-degree bins
+    const N_ANGLES = 120; // 3 degrees per step
     const TWO_PI = Math.PI * 2;
-    const binWeight = new Float32Array(N_BINS); // distance-weighted sum
-    const binFarDist = new Float32Array(N_BINS); // max distance in this bin
-    let totalPixels = 0;
-    let totalWeight = 0;
+    const scoreStreak = new Float32Array(N_ANGLES);
+    const scoreHits = new Float32Array(N_ANGLES);
+    const farInDir = new Float32Array(N_ANGLES);
 
-    const r2 = searchR * searchR;
-    const ex2 = excludeR * excludeR;
-    const be2 = ballExcludeR * ballExcludeR;
+    // Pre-build a map of ball exclusion to speed the inner loop.
+    // (Linear scan is fine for ~15 balls.)
 
-    for (let y = yMin; y <= yMax; y++) {
-      for (let x = xMin; x <= xMax; x++) {
-        const ddx = x - cue.x, ddy = y - cue.y;
-        const d2 = ddx * ddx + ddy * ddy;
-        if (d2 > r2) continue;
-        if (d2 < ex2) continue;
+    for (let ai = 0; ai < N_ANGLES; ai++) {
+      const ang = (ai / N_ANGLES) * TWO_PI;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      let streak = 0;
+      let maxStreak = 0;
+      let hits = 0;
+      let far = 0;
 
-        // Polygon filter with rail margin.
-        let inside = true;
+      for (let r = MIN_R; r <= MAX_R; r += STEP) {
+        const fx = cue.x + r * ca;
+        const fy = cue.y + r * sa;
+        const x = Math.round(fx);
+        const y = Math.round(fy);
+        if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) break;
+
+        // Polygon + rail margin check. If the ray leaves the allowed
+        // zone, abort the ray (everything past this point is off-table).
         if (havePoly) {
-          inside = pointInPoly(x, y, poly);
-          if (!inside && distToPolySq(x, y, poly) > RAIL_MARGIN2) continue;
+          const inside = pointInPoly(x, y, poly);
+          if (!inside && distToPolySq(x, y, poly) > RAIL_MARGIN2) break;
         }
 
-        const i = (y * W + x) * 4;
-        const r = data[i], g = data[i + 1], b = data[i + 2];
-
-        // Not felt: green dominance
-        if (g > r + 12 && g > b + 12 && g > 40) continue;
-
-        // Brightness filter. Stricter outside the polygon.
-        const bright = r + g + b;
-        if (inside) {
-          if (bright < 90) continue;
-        } else {
-          if (bright < 150) continue;
+        // Mask pockets: their dark pixels would otherwise register as stick
+        let inPocket = false;
+        for (let k = 0; k < pocketsArr.length; k++) {
+          const p = pocketsArr[k];
+          const dx2 = x - p.x, dy2 = y - p.y;
+          if (dx2 * dx2 + dy2 * dy2 < POCKET_EXCLUDE_R2) { inPocket = true; break; }
         }
+        if (inPocket) { streak = 0; continue; }
 
-        // Skip ball halos
-        let inBall = false;
+        // Mask other balls
+        let onBall = false;
         for (let k = 0; k < ballsArr.length; k++) {
           const bb = ballsArr[k];
           if (bb.isCue) continue;
           const dx2 = x - bb.x, dy2 = y - bb.y;
-          if (dx2 * dx2 + dy2 * dy2 < be2) { inBall = true; break; }
+          if (dx2 * dx2 + dy2 * dy2 < BALL_EXCLUDE_R2) { onBall = true; break; }
         }
-        if (inBall) continue;
+        if (onBall) { streak = 0; continue; }
 
-        // Vote into the angular histogram, weighted by distance
-        const d = Math.sqrt(d2);
-        let ang = Math.atan2(ddy, ddx); // [-PI, PI]
-        if (ang < 0) ang += TWO_PI;     // [0, 2PI)
-        const binIdx = Math.min(N_BINS - 1, Math.floor(ang / TWO_PI * N_BINS));
-        binWeight[binIdx] += d;
-        if (d > binFarDist[binIdx]) binFarDist[binIdx] = d;
-        totalPixels++;
-        totalWeight += d;
+        // Sample the pixel
+        const i = (y * W + x) * 4;
+        const red = data[i], green = data[i + 1], blue = data[i + 2];
+
+        // FELT detector (STRICTER here than ball detection): the felt is
+        // very saturated/bright green. The cue stick often has olive-green
+        // branding which is LESS green-dominant -> should NOT be rejected.
+        const isFelt = (green > red + 40) && (green > blue + 40) && (green > 80);
+        if (isFelt) { streak = 0; continue; }
+
+        // Brightness floor -> reject deep shadows / side panel leakage
+        const bright = red + green + blue;
+        if (bright < 100) { streak = 0; continue; }
+
+        // Valid stick pixel
+        streak += STEP;
+        hits += 1;
+        if (streak > maxStreak) maxStreak = streak;
+        far = r;
       }
+
+      scoreStreak[ai] = maxStreak;
+      scoreHits[ai] = hits;
+      farInDir[ai] = far;
     }
 
-    if (totalPixels < 60) {
+    // Smooth streak scores (3-tap) so pixels landing on a bin boundary
+    // don't split the peak between two adjacent angles.
+    const smooth = new Float32Array(N_ANGLES);
+    for (let i = 0; i < N_ANGLES; i++) {
+      smooth[i] =
+        scoreStreak[(i - 1 + N_ANGLES) % N_ANGLES] * 0.5 +
+        scoreStreak[i] * 1.0 +
+        scoreStreak[(i + 1) % N_ANGLES] * 0.5;
+    }
+
+    let peakAi = 0, peakVal = -1;
+    for (let i = 0; i < N_ANGLES; i++) {
+      if (smooth[i] > peakVal) { peakVal = smooth[i]; peakAi = i; }
+    }
+
+    // Require a meaningful streak length — a real cue stick has at least
+    // ~3 ball radii of continuous visible shaft around the cue ball.
+    if (scoreStreak[peakAi] < R * 3) {
       state.cueStick = null;
       return;
     }
 
-    // 5-tap smoothing (handles pixels that land exactly on a bin boundary)
-    // and find peak.
-    let peakBin = 0, peakSmooth = -1;
-    for (let i = 0; i < N_BINS; i++) {
-      const a = binWeight[(i - 2 + N_BINS) % N_BINS] * 0.3;
-      const b = binWeight[(i - 1 + N_BINS) % N_BINS] * 0.7;
-      const c = binWeight[i];
-      const d = binWeight[(i + 1) % N_BINS] * 0.7;
-      const e = binWeight[(i + 2) % N_BINS] * 0.3;
-      const s = a + b + c + d + e;
-      if (s > peakSmooth) { peakSmooth = s; peakBin = i; }
-    }
-
-    // Contrast check: peak must stand out clearly over noise floor.
-    // Smoothing kernel sums to 3.0 of a bin's weight; random noise yields
-    // about avgBin*3.0, so require the peak to be >= 1.8x the expected
-    // noise level.
-    const avgBin = totalWeight / N_BINS;
-    const noiseExpected = avgBin * 3.0;
-    if (peakSmooth < noiseExpected * 1.8) {
+    // And the peak must be clearly above the median (contrast check).
+    const sorted = Array.from(scoreStreak).sort((a, b) => a - b);
+    const median = sorted[(sorted.length / 2) | 0];
+    if (scoreStreak[peakAi] < median + R * 2) {
       state.cueStick = null;
       return;
     }
 
-    // The stick must also be LONG: need at least one pixel far from the
-    // cue ball in the peak direction (and the 2 adjacent bins, to tolerate
-    // pixels landing at a bin boundary).
-    const farInPeak = Math.max(
-      binFarDist[peakBin],
-      binFarDist[(peakBin - 1 + N_BINS) % N_BINS],
-      binFarDist[(peakBin + 1) % N_BINS],
-    );
-    if (farInPeak < R * 3) {
-      state.cueStick = null;
-      return;
-    }
-
-    // Parabolic interpolation around the peak for sub-bin resolution.
-    const yM1 = binWeight[(peakBin - 1 + N_BINS) % N_BINS];
-    const y0  = binWeight[peakBin];
-    const yP1 = binWeight[(peakBin + 1) % N_BINS];
+    // Parabolic sub-bin interpolation for precise angle
+    const yM1 = smooth[(peakAi - 1 + N_ANGLES) % N_ANGLES];
+    const y0  = smooth[peakAi];
+    const yP1 = smooth[(peakAi + 1) % N_ANGLES];
     const denom = (yM1 - 2 * y0 + yP1);
     const offset = Math.abs(denom) > 1e-6 ? 0.5 * (yM1 - yP1) / denom : 0;
-    const refinedBin = peakBin + offset;
-    const buttAngle = ((refinedBin + 0.5) / N_BINS) * TWO_PI;
-    const buttDX = Math.cos(buttAngle);
-    const buttDY = Math.sin(buttAngle);
+    const refined = (peakAi + offset) / N_ANGLES * TWO_PI;
 
-    // Shot direction = opposite of butt direction (the ball goes away
-    // from the stick body).
+    const buttDX = Math.cos(refined);
+    const buttDY = Math.sin(refined);
     const shotDX = -buttDX;
     const shotDY = -buttDY;
 
     state.cueStick = {
-      cmx: cue.x + buttDX * farInPeak * 0.5,
-      cmy: cue.y + buttDY * farInPeak * 0.5,
       dx: shotDX,
       dy: shotDY,
-      count: totalPixels,
-      farX: cue.x + buttDX * farInPeak,
-      farY: cue.y + buttDY * farInPeak,
-      peakRatio: peakSmooth / (noiseExpected || 1),
+      buttDX, buttDY,
+      cmx: cue.x + buttDX * farInDir[peakAi] * 0.5,
+      cmy: cue.y + buttDY * farInDir[peakAi] * 0.5,
+      count: scoreHits[peakAi],
+      streakLen: scoreStreak[peakAi],
+      farX: cue.x + buttDX * farInDir[peakAi],
+      farY: cue.y + buttDY * farInDir[peakAi],
     };
 
     autoPickTargetAlongCue();
@@ -1456,6 +1451,37 @@
         ctx.stroke();
         ctx.restore();
       }
+    }
+
+    // DEBUG: draw the raw detected cue-stick direction as a RED overlay
+    // so we can visually verify the detector independently of the aim
+    // pipeline. If this red line doesn't align with the real cue, the
+    // detector itself is wrong. If it does align but the green aim goes
+    // elsewhere, the downstream target-picking is the culprit.
+    if (state.cueBall && state.cueStick) {
+      const cueCss = gameToCss(state.cueBall);
+      const rect = getCanvasRectInTopFrame(state.gameCanvas);
+      const sx = rect.width / state.gameCanvas.width;
+      const sy = rect.height / state.gameCanvas.height;
+      const { dx, dy, buttDX, buttDY } = state.cueStick;
+      ctx.save();
+      // Shot direction: bright red, full length forward
+      ctx.strokeStyle = 'rgba(255,60,60,0.85)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cueCss.x, cueCss.y);
+      ctx.lineTo(cueCss.x + dx * sx * 120, cueCss.y + dy * sy * 120);
+      ctx.stroke();
+      // Butt direction: dim red, shorter (behind the cue ball)
+      if (typeof buttDX === 'number' && typeof buttDY === 'number') {
+        ctx.strokeStyle = 'rgba(255,60,60,0.35)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cueCss.x, cueCss.y);
+        ctx.lineTo(cueCss.x + buttDX * sx * 80, cueCss.y + buttDY * sy * 80);
+        ctx.stroke();
+      }
+      ctx.restore();
     }
 
     // Aim
