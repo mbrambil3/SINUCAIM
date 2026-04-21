@@ -160,3 +160,5 @@ test_plan:
 agent_communication:
   - agent: "main"
     message: "Três fixes aplicados na extensão (extension/content.js): (1) novo botão 'Carregar calibragem' restaura os 4 cantos + caçapas + raio salvos, (2) overlay não é mais escondido durante captura → sem flicker, (3) flag ballRadiusManual impede auto-override do raio setado pelo usuário. Não é aplicação web testável via deep_testing_backend/frontend — é Chrome Extension. O usuário precisa recarregar a extensão (chrome://extensions → Reload) para validar."
+  - agent: "main"
+    message: "Fix adicional: reduzido o delay da mira. Loop de detecção trocado de setInterval(1500ms) → recursivo setTimeout com intervalo adaptativo: 80ms em modo 'direct' (~12fps) e 350ms em modo 'capture' (~3fps, respeitando throttle do captureVisibleTab). Captura mudada de PNG → JPEG quality 60 (3-5x mais rápida). Resultado: a mira atualiza praticamente em tempo real em modo direct e ~5x mais rápido em modo screenshot."

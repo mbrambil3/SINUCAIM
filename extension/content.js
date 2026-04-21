@@ -281,7 +281,7 @@
           <button data-action="calibrate" data-testid="btn-calibrate">Calibrar</button>
           <button data-action="loadcalib" data-testid="btn-load-calib">Carregar calibragem</button>
           <button data-action="detect" data-testid="btn-detect">Detectar bolas</button>
-          <button data-action="pause" class="primary wide" data-testid="btn-pause">Pausar detecção (sem flicker)</button>
+          <button data-action="pause" class="primary wide" data-testid="btn-pause">Pausar detecção</button>
           <button data-action="cue" data-testid="btn-pick-cue">Escolher branca</button>
           <button data-action="target" data-testid="btn-pick-target">Escolher alvo</button>
           <button data-action="pocket" data-testid="btn-pick-pocket">Escolher caçapa</button>
@@ -389,16 +389,16 @@
   function handleAction(action) {
     switch (action) {
       case 'pause': {
-        if (state._detectInterval) {
+        if (state._detectRunning) {
           stopContinuousDetection();
           const btn = state.panel && state.panel.querySelector('[data-testid="btn-pause"]');
           if (btn) btn.textContent = 'Retomar detecção';
-          setHint('Deteccao pausada (sem flicker). A mira atual fica congelada. Clique "Retomar deteccao" para seguir.');
+          setHint('Deteccao pausada. A mira atual fica congelada. Clique "Retomar deteccao" para seguir.');
         } else {
           startContinuousDetection();
           const btn = state.panel && state.panel.querySelector('[data-testid="btn-pause"]');
-          if (btn) btn.textContent = 'Pausar detecção (sem flicker)';
-          setHint('Deteccao retomada. Atualiza cada 1.5s.');
+          if (btn) btn.textContent = 'Pausar detecção';
+          setHint('Deteccao retomada.');
         }
         break;
       }
@@ -1103,18 +1103,45 @@
   /* Continuous detection loop                                          */
   /* ------------------------------------------------------------------ */
   function startContinuousDetection() {
-    if (state._detectInterval) return;
-    state._detectInterval = setInterval(async () => {
-      if (!state.gameCanvas || state.corners.length !== 4) return;
+    if (state._detectRunning) return;
+    state._detectRunning = true;
+
+    const loop = async () => {
+      if (!state._detectRunning) return;
+      if (!state.gameCanvas || state.corners.length !== 4) {
+        state._detectTimeout = setTimeout(loop, 300);
+        return;
+      }
+      const t0 = performance.now();
       try {
         await detectBalls();
       } catch (e) {
         state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
         updateStatusLine();
       }
-    }, 1500); // 1500ms interval keeps flicker brief (~16ms every 1.5s = ~1% hidden)
+      // Adaptive interval: in 'direct' mode we can read the canvas almost
+      // instantly, so poll the cue stick / balls at ~12 fps for a responsive
+      // aim line. In 'capture' (screenshot) mode we must respect Chrome's
+      // ~2/sec soft throttle on tabs.captureVisibleTab, so aim for ~3/sec.
+      const elapsed = performance.now() - t0;
+      let target;
+      if (state._captureMode === 'direct') {
+        target = 80; // ~12 fps
+      } else {
+        target = 350; // ~3 fps, safe under Chrome's captureVisibleTab quota
+      }
+      const wait = Math.max(30, target - elapsed);
+      state._detectTimeout = setTimeout(loop, wait);
+    };
+    loop();
   }
   function stopContinuousDetection() {
+    state._detectRunning = false;
+    if (state._detectTimeout) {
+      clearTimeout(state._detectTimeout);
+      state._detectTimeout = null;
+    }
+    // Legacy guard (in case an older setInterval is still live)
     if (state._detectInterval) {
       clearInterval(state._detectInterval);
       state._detectInterval = null;

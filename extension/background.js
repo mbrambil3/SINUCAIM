@@ -7,8 +7,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'capture') {
     // Capture the visible area of the tab that sent the message.
+    // Use JPEG at quality 60: ~3-5x smaller/faster than PNG and perfectly
+    // adequate for the color-threshold ball detection.
     const windowId = sender && sender.tab && sender.tab.windowId;
-    const opts = { format: 'png' };
+    const opts = { format: 'jpeg', quality: 60 };
     const cb = (dataUrl) => {
       if (chrome.runtime.lastError) {
         sendResponse({ ok: false, error: chrome.runtime.lastError.message });
