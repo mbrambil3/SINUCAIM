@@ -60,29 +60,38 @@
     return true;
   });
 
-  function waitForCanvasAndStart(tries = 0) {
+  function waitForCanvasAndStart() {
+    // Always mount the panel immediately so the user sees feedback
+    if (!state.panel) mountPanel();
+    tryMountOverlay(false);
+    // Keep polling for the canvas in the background in case it mounts later
+    clearInterval(state._canvasPoll);
+    state._canvasPoll = setInterval(() => {
+      if (state.gameCanvas) { clearInterval(state._canvasPoll); return; }
+      tryMountOverlay(true);
+    }, 1000);
+  }
+
+  function tryMountOverlay(silent) {
     const canvas = findGameCanvas();
-    if (canvas) {
-      state.gameCanvas = canvas;
-      mountOverlay();
-      mountPanel();
-      startLoop();
-      return;
+    if (!canvas) {
+      if (!silent) setHint('Canvas do jogo NAO encontrado. Clique em "Achar jogo" ou recarregue a pagina.');
+      return false;
     }
-    if (tries > 40) {
-      console.warn('[SinucadaAim] Canvas do jogo nao encontrado.');
-      return;
-    }
-    setTimeout(() => waitForCanvasAndStart(tries + 1), 500);
+    state.gameCanvas = canvas;
+    if (!state.overlay) mountOverlay();
+    if (!state.rafId) startLoop();
+    setHint('Canvas detectado! Clique em "Calibrar" e marque os 4 cantos da mesa.');
+    return true;
   }
 
   function findGameCanvas() {
-    const canvases = Array.from(document.querySelectorAll('canvas'));
+    const canvases = collectAllCanvases();
     if (canvases.length === 0) return null;
     let best = null;
     let bestArea = 0;
     for (const c of canvases) {
-      const r = c.getBoundingClientRect();
+      const r = getCanvasRectInTopFrame(c);
       const area = r.width * r.height;
       if (area > bestArea && r.width > 200 && r.height > 150) {
         bestArea = area;
@@ -92,8 +101,50 @@
     return best;
   }
 
+  // Collect canvases from top frame and from same-origin iframes recursively
+  function collectAllCanvases() {
+    const list = [];
+    function walk(doc) {
+      if (!doc) return;
+      try {
+        list.push(...doc.querySelectorAll('canvas'));
+        const iframes = doc.querySelectorAll('iframe');
+        for (const f of iframes) {
+          try { walk(f.contentDocument); } catch (e) { /* cross-origin */ }
+        }
+      } catch (e) { /* ignore */ }
+    }
+    walk(document);
+    return list;
+  }
+
+  // Returns canvas bounding rect in top-window CSS coordinates,
+  // accounting for nested same-origin iframes.
+  function getCanvasRectInTopFrame(canvas) {
+    let rect = canvas.getBoundingClientRect();
+    let offX = 0, offY = 0;
+    let win = canvas.ownerDocument.defaultView;
+    while (win && win !== window.top) {
+      const frame = win.frameElement;
+      if (!frame) break;
+      const fr = frame.getBoundingClientRect();
+      offX += fr.left;
+      offY += fr.top;
+      win = win.parent;
+    }
+    return {
+      left: rect.left + offX,
+      top: rect.top + offY,
+      right: rect.right + offX,
+      bottom: rect.bottom + offY,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
   function teardown() {
     stopLoop();
+    if (state._canvasPoll) { clearInterval(state._canvasPoll); state._canvasPoll = null; }
     if (state.overlay && state.overlay.parentNode) {
       state.overlay.parentNode.removeChild(state.overlay);
     }
@@ -123,7 +174,7 @@
 
   function syncOverlay() {
     if (!state.overlay || !state.gameCanvas) return;
-    const rect = state.gameCanvas.getBoundingClientRect();
+    const rect = getCanvasRectInTopFrame(state.gameCanvas);
     const overlay = state.overlay;
     overlay.style.left = rect.left + 'px';
     overlay.style.top = rect.top + 'px';
@@ -139,14 +190,14 @@
   // Game canvas pixel <-> overlay CSS pixel conversion helpers
   function gameToCss(pt) {
     if (!state.gameCanvas) return pt;
-    const rect = state.gameCanvas.getBoundingClientRect();
+    const rect = getCanvasRectInTopFrame(state.gameCanvas);
     const sx = rect.width / state.gameCanvas.width;
     const sy = rect.height / state.gameCanvas.height;
     return { x: pt.x * sx, y: pt.y * sy };
   }
   function cssToGame(cssX, cssY) {
     if (!state.gameCanvas) return { x: cssX, y: cssY };
-    const rect = state.gameCanvas.getBoundingClientRect();
+    const rect = getCanvasRectInTopFrame(state.gameCanvas);
     const sx = state.gameCanvas.width / rect.width;
     const sy = state.gameCanvas.height / rect.height;
     return { x: cssX * sx, y: cssY * sy };
@@ -189,6 +240,7 @@
         </div>
 
         <div class="sa-actions">
+          <button data-action="find" class="primary wide" data-testid="btn-find">Achar jogo (canvas)</button>
           <button data-action="calibrate" data-testid="btn-calibrate">Calibrar</button>
           <button data-action="detect" data-testid="btn-detect">Detectar bolas</button>
           <button data-action="cue" data-testid="btn-pick-cue">Escolher branca</button>
@@ -199,8 +251,9 @@
         </div>
 
         <div class="sa-hint" data-testid="hint">
-          Clique em "Calibrar" e, em ordem, marque os cantos:
-          superior-esquerdo, superior-direito, inferior-direito, inferior-esquerdo.
+          Se o painel apareceu mas nada acontece, clique em "Achar jogo"
+          depois em "Calibrar" e marque os cantos da mesa em ordem:
+          SUP-ESQ, SUP-DIR, INF-DIR, INF-ESQ.
         </div>
       </div>
     `;
@@ -295,7 +348,17 @@
   /* ------------------------------------------------------------------ */
   function handleAction(action) {
     switch (action) {
+      case 'find': {
+        const ok = tryMountOverlay(false);
+        if (ok) {
+          const r = getCanvasRectInTopFrame(state.gameCanvas);
+          setHint(`Canvas achado (${Math.round(r.width)}x${Math.round(r.height)}). Agora clique em "Calibrar".`);
+        }
+        break;
+      }
       case 'calibrate':
+        if (!state.gameCanvas) { tryMountOverlay(false); }
+        if (!state.gameCanvas) return setHint('Canvas do jogo nao encontrado. Clique "Achar jogo".');
         state.mode = 'calibrate';
         state.corners = [];
         state.pockets = [];
@@ -303,24 +366,28 @@
         enableInteractive(true);
         break;
       case 'cue':
+        if (!state.gameCanvas) return setHint('Canvas nao encontrado. Clique "Achar jogo".');
         if (state.corners.length !== 4) return setHint('Calibre a mesa primeiro (4 cantos).');
         state.mode = 'select-cue';
         setHint('Clique sobre a BOLA BRANCA.');
         enableInteractive(true);
         break;
       case 'target':
+        if (!state.gameCanvas) return setHint('Canvas nao encontrado. Clique "Achar jogo".');
         if (state.corners.length !== 4) return setHint('Calibre a mesa primeiro.');
         state.mode = 'select-target';
         setHint('Clique na BOLA ALVO que quer encaçapar.');
         enableInteractive(true);
         break;
       case 'pocket':
+        if (!state.gameCanvas) return setHint('Canvas nao encontrado. Clique "Achar jogo".');
         if (state.corners.length !== 4) return setHint('Calibre a mesa primeiro.');
         state.mode = 'select-pocket';
         setHint('Clique na caçapa desejada (ou em qualquer ponto proximo a ela).');
         enableInteractive(true);
         break;
       case 'detect':
+        if (!state.gameCanvas) return setHint('Canvas nao encontrado. Clique "Achar jogo".');
         if (state.corners.length !== 4) return setHint('Calibre a mesa antes de detectar bolas.');
         try {
           detectBalls();
