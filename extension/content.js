@@ -23,6 +23,7 @@
     corners: [], // [TL, TR, BR, BL]
     pockets: [], // derived: 4 corners + 2 side mids
     ballRadius: 13, // pixels in game canvas space (auto-calibrated after detection)
+    ballRadiusManual: false, // true once the user touches the slider -> disables auto-calibration
     // Selection
     mode: 'idle', // 'calibrate' | 'select-cue' | 'select-target' | 'select-pocket' | 'idle'
     cueBall: null,
@@ -46,6 +47,7 @@
         if (Array.isArray(c.corners)) state.corners = c.corners;
         if (Array.isArray(c.pockets)) state.pockets = c.pockets;
         if (typeof c.ballRadius === 'number') state.ballRadius = c.ballRadius;
+        if (c.ballRadiusManual === true) state.ballRadiusManual = true;
       } catch (e) { /* ignore */ }
     }
     if (res[STORAGE_KEY]) {
@@ -277,6 +279,7 @@
         <div class="sa-actions">
           <button data-action="find" class="primary wide" data-testid="btn-find">Achar jogo (canvas)</button>
           <button data-action="calibrate" data-testid="btn-calibrate">Calibrar</button>
+          <button data-action="loadcalib" data-testid="btn-load-calib">Carregar calibragem</button>
           <button data-action="detect" data-testid="btn-detect">Detectar bolas</button>
           <button data-action="pause" class="primary wide" data-testid="btn-pause">Pausar detecção (sem flicker)</button>
           <button data-action="cue" data-testid="btn-pick-cue">Escolher branca</button>
@@ -319,6 +322,7 @@
     const valSpan = panel.querySelector('[data-testid="radius-val"]');
     slider.addEventListener('input', () => {
       state.ballRadius = parseInt(slider.value, 10);
+      state.ballRadiusManual = true; // user-set value: disable auto-calibration
       valSpan.textContent = state.ballRadius;
       saveCalibration();
     });
@@ -415,6 +419,48 @@
         setHint('Clique nos 4 cantos da mesa na ordem: SUP-ESQ, SUP-DIR, INF-DIR, INF-ESQ.');
         enableInteractive(true);
         break;
+      case 'loadcalib':
+        if (!state.gameCanvas) { tryMountOverlay(false); }
+        if (!state.gameCanvas) return setHint('Canvas do jogo nao encontrado. Clique "Achar jogo".');
+        chrome.storage.local.get([CALIB_KEY], (res) => {
+          const c = res && res[CALIB_KEY];
+          if (!c || !Array.isArray(c.corners) || c.corners.length !== 4) {
+            setHint('Nenhuma calibragem anterior encontrada. Use "Calibrar" uma vez.');
+            return;
+          }
+          state.corners = c.corners;
+          state.pockets = (Array.isArray(c.pockets) && c.pockets.length === 6)
+            ? c.pockets
+            : derivePockets(c.corners);
+          if (typeof c.ballRadius === 'number') {
+            state.ballRadius = c.ballRadius;
+            if (state.panel) {
+              const slider = state.panel.querySelector('[data-testid="radius-range"]');
+              const vs = state.panel.querySelector('[data-testid="radius-val"]');
+              if (slider) slider.value = state.ballRadius;
+              if (vs) vs.textContent = state.ballRadius;
+            }
+          }
+          if (c.ballRadiusManual === true) state.ballRadiusManual = true;
+          state.mode = 'idle';
+          enableInteractive(false);
+          setHint('Calibragem anterior carregada! Iniciando detecção de bolas...');
+          updateStepUI();
+          detectBalls()
+            .then(() => {
+              setHint(`Calibragem carregada. ${state.detectedBalls.length} bolas detectadas. Clique numa bola ALVO ou deixe a mira seguir o taco.`);
+              state.mode = 'select-target';
+              enableInteractive(true);
+              updateStepUI();
+            })
+            .catch((e) => {
+              state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
+              updateStatusLine();
+              setHint('Calibragem carregada. Aguardando deteccao via screenshot...');
+            });
+          startContinuousDetection();
+        });
+        break;
       case 'cue':
         if (!state.gameCanvas) return setHint('Canvas nao encontrado. Clique "Achar jogo".');
         if (state.corners.length !== 4) return setHint('Calibre a mesa primeiro (4 cantos).');
@@ -477,6 +523,7 @@
         state.cueManual = false;
         state.targetManual = false;
         state.cueStick = null;
+        state.ballRadiusManual = false;
         state.mode = 'idle';
         enableInteractive(false);
         stopContinuousDetection();
@@ -601,6 +648,7 @@
         corners: state.corners,
         pockets: state.pockets,
         ballRadius: state.ballRadius,
+        ballRadiusManual: state.ballRadiusManual,
       },
     });
   }
@@ -636,15 +684,11 @@
     } catch (e) { /* fall through */ }
 
     // Fallback path: captureVisibleTab via service worker (compositor readback)
-    // IMPORTANT: the screenshot captures our own overlay too, which would
-    // show up as white/colored blobs (pocket markers, aim ring, detection
-    // highlights) and confuse the ball detection. So we hide the overlay
-    // for ONE frame, capture, then restore. Interval is set to 1500ms so
-    // the user only sees a ~16ms blink roughly once per 1.5s.
-    const wasVisible = state.overlay && state.overlay.style.visibility !== 'hidden';
-    if (wasVisible) state.overlay.style.visibility = 'hidden';
-    await new Promise((r) => requestAnimationFrame(r));
-
+    // NOTE: we used to hide the overlay for one frame here to avoid our own
+    // markers being re-detected as balls. That caused the user-visible flicker
+    // every 1.5s. Our overlay now draws only thin 2px outlines — the detection
+    // pipeline (1-pixel erosion + 0.35 fill-ratio filter) rejects those strokes
+    // entirely, so we can keep the overlay fully visible during capture.
     const resp = await new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage({ type: 'capture' }, (r) => {
@@ -653,8 +697,6 @@
         });
       } catch (e) { resolve({ ok: false, error: String(e) }); }
     });
-
-    if (wasVisible && state.overlay) state.overlay.style.visibility = 'visible';
 
     if (!resp || !resp.ok) throw new Error('capture_failed:' + (resp && resp.error));
 
@@ -826,7 +868,9 @@
 
     // Auto-calibrate ballRadius to the median radius detected (gives
     // better ghost ball sizing without the user touching the slider).
-    if (balls.length >= 3) {
+    // IMPORTANT: skip this if the user has manually set the radius via
+    // the slider — otherwise it would override the user's choice.
+    if (balls.length >= 3 && !state.ballRadiusManual) {
       const sorted = balls.map((b) => b.r).sort((a, b) => a - b);
       const medR = sorted[Math.floor(sorted.length / 2)];
       if (medR > 4 && medR < 80) {

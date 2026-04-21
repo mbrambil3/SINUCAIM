@@ -101,3 +101,62 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+user_problem_statement: |
+  Extensão Sinucada Aim Helper — três melhorias:
+  1) Permitir carregar calibragem anterior (evitar recalibrar os 4 cantos toda vez).
+  2) Eliminar o flicker da mira (piscava a cada 1.5s).
+  3) O raio das bolas definido manualmente deve ficar fixo (estava sendo auto-sobrescrito).
+
+frontend:
+  - task: "Botão Carregar calibragem (reuso dos 4 cantos salvos)"
+    implemented: true
+    working: "NA"
+    file: "extension/content.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Adicionado botão [data-testid=btn-load-calib] que lê chrome.storage.local['sinucadaAimCalibration'] e restaura corners, pockets e ballRadius sem pedir clique nos 4 cantos. Dispara detectBalls + startContinuousDetection automaticamente."
+
+  - task: "Sem flicker durante captureVisibleTab"
+    implemented: true
+    working: "NA"
+    file: "extension/content.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Removido o visibility:hidden do overlay durante a captura. Renderização usa apenas contornos finos (2px) que são eliminados pela erosão + filtro de fill ratio na detecção, então não contaminam as screenshots. A mira agora fica visível continuamente."
+
+  - task: "Raio das bolas fixo quando definido pelo usuário"
+    implemented: true
+    working: "NA"
+    file: "extension/content.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Adicionada flag state.ballRadiusManual (persistida em storage). Ativada ao arrastar o slider. A auto-calibragem de raio na runDetection só roda se !ballRadiusManual, preservando o valor definido pelo usuário (ex.: 13)."
+
+metadata:
+  created_by: "main_agent"
+  version: "1.1"
+  test_sequence: 0
+  run_ui: false
+
+test_plan:
+  current_focus: []
+  stuck_tasks: []
+  test_all: false
+  test_priority: "high_first"
+
+agent_communication:
+  - agent: "main"
+    message: "Três fixes aplicados na extensão (extension/content.js): (1) novo botão 'Carregar calibragem' restaura os 4 cantos + caçapas + raio salvos, (2) overlay não é mais escondido durante captura → sem flicker, (3) flag ballRadiusManual impede auto-override do raio setado pelo usuário. Não é aplicação web testável via deep_testing_backend/frontend — é Chrome Extension. O usuário precisa recarregar a extensão (chrome://extensions → Reload) para validar."
