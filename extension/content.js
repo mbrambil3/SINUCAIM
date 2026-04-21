@@ -957,7 +957,10 @@
   function detectCueStick(data, W, H, minX, maxX, minY, maxY, balls) {
     const cue = state.cueBall;
     const R = state.ballRadius;
-    const searchR = Math.max(120, R * 12); // 12x ball radius search window
+    // Search window: 10x ball radius — big enough to see the shaft, small
+    // enough to avoid grabbing far-off UI pixels when the cue ball is near
+    // a rail.
+    const searchR = Math.max(100, R * 10);
     const excludeR = R * 1.6; // mask out the cue ball itself
     const ballExcludeR = R * 1.3; // mask out other balls
     const xMin = Math.max(minX, Math.floor(cue.x - searchR));
@@ -967,6 +970,7 @@
 
     // Precompute ball centers to avoid repeated array scans
     const ballsArr = balls;
+    const poly = state.corners;
 
     let sumX = 0, sumY = 0, count = 0;
     let farX = 0, farY = 0, farDist = -1;
@@ -980,10 +984,19 @@
         const d2 = ddx * ddx + ddy * ddy;
         if (d2 > r2) continue;
         if (d2 < ex2) continue; // skip the cue ball itself
+        // CRITICAL: only consider pixels INSIDE the table polygon. Without
+        // this, when the cue ball is near a rail, our own side panel (dark
+        // gray), the wooden rails, chat boxes and other UI get counted as
+        // "cue stick pixels" and drag the center-of-mass in the wrong
+        // direction, making the aim line point backwards.
+        if (poly.length === 4 && !pointInPoly(x, y, poly)) continue;
         const i = (y * W + x) * 4;
         const r = data[i], g = data[i + 1], b = data[i + 2];
         // Not felt: green not dominant
         if (g > r + 12 && g > b + 12 && g > 40) continue;
+        // Reject very dark pixels (panel, shadows, rails) — the cue stick
+        // body always has decent brightness even in the darker parts.
+        if (r + g + b < 90) continue;
         // Skip any ball area
         let inBall = false;
         for (let k = 0; k < ballsArr.length; k++) {
@@ -1006,8 +1019,15 @@
     const cmx = sumX / count, cmy = sumY / count;
     // Direction from stick center-of-mass toward the cue ball (unit vector).
     let dx = cue.x - cmx, dy = cue.y - cmy;
-    const norm = Math.hypot(dx, dy) || 1;
-    dx /= norm; dy /= norm;
+    const dist = Math.hypot(dx, dy);
+    // Ambiguity guard: if the center-of-mass is essentially on top of the
+    // cue ball (distance under half a ball), direction is unreliable — drop
+    // the stick reading rather than showing a random aim.
+    if (dist < R * 0.5) {
+      state.cueStick = null;
+      return;
+    }
+    dx /= dist; dy /= dist;
     state.cueStick = {
       cmx, cmy,
       dx, dy,
