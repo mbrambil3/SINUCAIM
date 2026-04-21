@@ -661,27 +661,40 @@
     if (!src) throw new Error('no_canvas');
     const W = src.width, H = src.height;
 
-    // Fast path: drawImage (works only if WebGL preserveDrawingBuffer=true)
-    try {
-      const off = document.createElement('canvas');
-      off.width = W; off.height = H;
-      const octx = off.getContext('2d', { willReadFrequently: true });
-      octx.drawImage(src, 0, 0);
-      const img = octx.getImageData(0, 0, W, H);
-      const data = img.data;
-      let nonBlack = 0;
-      const stride = Math.max(4, ((data.length / 4 / 1500) | 0) * 4);
-      for (let i = 0; i < data.length; i += stride) {
-        if (data[i] + data[i + 1] + data[i + 2] > 30) {
-          nonBlack++;
-          if (nonBlack > 30) break;
+    // Fast path: drawImage (works only if WebGL preserveDrawingBuffer=true).
+    // Once we know direct reads return black (WebGL w/o preserveDrawingBuffer),
+    // skip this attempt — saves ~5-10ms per cycle.
+    if (state._directPathBlocked !== true) {
+      try {
+        const off = document.createElement('canvas');
+        off.width = W; off.height = H;
+        const octx = off.getContext('2d', { willReadFrequently: true });
+        octx.drawImage(src, 0, 0);
+        const img = octx.getImageData(0, 0, W, H);
+        const data = img.data;
+        let nonBlack = 0;
+        const stride = Math.max(4, ((data.length / 4 / 1500) | 0) * 4);
+        for (let i = 0; i < data.length; i += stride) {
+          if (data[i] + data[i + 1] + data[i + 2] > 30) {
+            nonBlack++;
+            if (nonBlack > 30) break;
+          }
         }
+        if (nonBlack > 30) {
+          state._captureMode = 'direct';
+          state._directFailStreak = 0;
+          return img;
+        } else {
+          state._directFailStreak = (state._directFailStreak || 0) + 1;
+          if (state._directFailStreak >= 3) {
+            state._directPathBlocked = true;
+          }
+        }
+      } catch (e) {
+        state._directFailStreak = (state._directFailStreak || 0) + 1;
+        if (state._directFailStreak >= 3) state._directPathBlocked = true;
       }
-      if (nonBlack > 30) {
-        state._captureMode = 'direct';
-        return img;
-      }
-    } catch (e) { /* fall through */ }
+    }
 
     // Fallback path: captureVisibleTab via service worker (compositor readback)
     // NOTE: we used to hide the overlay for one frame here to avoid our own
@@ -1053,8 +1066,11 @@
     const d = state.lastDetection;
     const age = d.ts ? Math.floor((Date.now() - d.ts) / 100) / 10 : '—';
     const mode = state._captureMode === 'direct' ? 'direct' : (state._captureMode === 'capture' ? 'screenshot' : '?');
-    if (d.error && d.error.indexOf('capture_failed') === 0) {
-      el.textContent = 'Erro captura: ' + d.error;
+    if (d.error && d.error.indexOf('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND') >= 0) {
+      el.textContent = 'Ajustando ritmo de captura (Chrome quota)...';
+      el.style.color = '#d29922';
+    } else if (d.error && d.error.indexOf('capture_failed') === 0) {
+      el.textContent = 'Erro captura: ' + d.error.replace('capture_failed:', '');
       el.style.color = '#ff7b72';
     } else if (d.error && d.error !== 'not_calibrated') {
       el.textContent = 'Erro: ' + d.error;
@@ -1105,6 +1121,7 @@
   function startContinuousDetection() {
     if (state._detectRunning) return;
     state._detectRunning = true;
+    state._quotaBackoff = 0; // extra delay added when we hit capture quota
 
     const loop = async () => {
       if (!state._detectRunning) return;
@@ -1113,23 +1130,35 @@
         return;
       }
       const t0 = performance.now();
+      let quotaHit = false;
       try {
         await detectBalls();
       } catch (e) {
-        state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
+        const msg = e && e.message ? e.message : String(e);
+        state.lastDetection = { ts: Date.now(), count: 0, error: msg };
         updateStatusLine();
+        if (msg.indexOf('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND') >= 0) {
+          quotaHit = true;
+        }
       }
-      // Adaptive interval: in 'direct' mode we can read the canvas almost
-      // instantly, so poll the cue stick / balls at ~12 fps for a responsive
-      // aim line. In 'capture' (screenshot) mode we must respect Chrome's
-      // ~2/sec soft throttle on tabs.captureVisibleTab, so aim for ~3/sec.
+      // Adaptive interval:
+      //   direct  -> ~12 fps (80ms)  — no Chrome throttle applies
+      //   capture -> ~2 fps (500ms)  — Chrome enforces 2 calls/sec quota
+      // When we hit the quota we temporarily back off by +200ms (cap +1000ms)
+      // and drain the counter by 50ms on every subsequent successful call.
       const elapsed = performance.now() - t0;
       let target;
       if (state._captureMode === 'direct') {
-        target = 80; // ~12 fps
+        target = 80;
       } else {
-        target = 350; // ~3 fps, safe under Chrome's captureVisibleTab quota
+        target = 500;
       }
+      if (quotaHit) {
+        state._quotaBackoff = Math.min(1000, (state._quotaBackoff || 0) + 200);
+      } else {
+        state._quotaBackoff = Math.max(0, (state._quotaBackoff || 0) - 50);
+      }
+      target += state._quotaBackoff;
       const wait = Math.max(30, target - elapsed);
       state._detectTimeout = setTimeout(loop, wait);
     };
