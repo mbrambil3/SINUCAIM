@@ -28,8 +28,10 @@
     cueBall: null,
     cueManual: false,
     targetBall: null,
+    targetManual: false,
     targetPocket: null,
     detectedBalls: [],
+    cueStick: null,
     rafId: null,
     lastDetection: { ts: 0, count: 0, error: null },
   };
@@ -440,9 +442,10 @@
         state.targetBall = null;
         state.targetPocket = null;
         state.cueManual = false;
+        state.targetManual = false;
         state.mode = 'idle';
         enableInteractive(false);
-        setHint('Seleção limpa. Clique numa bola ALVO para mira automatica.');
+        setHint('Selecao limpa. A mira segue o taco automaticamente. Clique numa bola para forcar alvo manual.');
         // re-enter select-target for one-click aim
         if (state.corners.length === 4) {
           state.mode = 'select-target';
@@ -457,6 +460,8 @@
         state.targetPocket = null;
         state.detectedBalls = [];
         state.cueManual = false;
+        state.targetManual = false;
+        state.cueStick = null;
         state.mode = 'idle';
         enableInteractive(false);
         stopContinuousDetection();
@@ -516,6 +521,7 @@
       setHint('Bola branca selecionada. Agora clique em "Escolher alvo".');
     } else if (state.mode === 'select-target') {
       state.targetBall = snapToDetected(pt) || pt;
+      state.targetManual = true;
       // Auto-pick best pocket (min cut angle) if we have cue ball + pockets
       if (state.cueBall && state.pockets.length === 6) {
         state.targetPocket = findBestPocket(
@@ -615,6 +621,14 @@
     } catch (e) { /* fall through */ }
 
     // Fallback path: captureVisibleTab via service worker (compositor readback)
+    // IMPORTANT: the screenshot captures our own overlay too, which would
+    // show up as white/colored blobs (pocket markers, aim ring, detection
+    // highlights) and confuse the ball detection. So we hide the overlay
+    // briefly, wait two frames, capture, then restore visibility.
+    const wasVisible = state.overlay && state.overlay.style.visibility !== 'hidden';
+    if (wasVisible) state.overlay.style.visibility = 'hidden';
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
     const resp = await new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage({ type: 'capture' }, (r) => {
@@ -623,6 +637,9 @@
         });
       } catch (e) { resolve({ ok: false, error: String(e) }); }
     });
+
+    if (wasVisible && state.overlay) state.overlay.style.visibility = 'visible';
+
     if (!resp || !resp.ok) throw new Error('capture_failed:' + (resp && resp.error));
 
     const fullImg = await loadImage(resp.dataUrl);
@@ -795,20 +812,32 @@
       }
     }
 
-    // Whitest blob = cue ball. Score rewards high brightness AND low color spread.
+    // Whitest blob = cue ball. Require pure white AND temporally stable.
     let cueIdx = -1, bestScore = -Infinity;
     for (let i = 0; i < balls.length; i++) {
       const c = balls[i].color;
       const bright = (c.r + c.g + c.b) / 3;
       const spread = Math.max(c.r, c.g, c.b) - Math.min(c.r, c.g, c.b);
-      const score = bright - spread * 2;
+      // Hard gate: must be genuinely white (not a striped ball's white half)
+      if (bright < 170 || spread > 45) continue;
+      // Area gate: must be close to typical ball area (no tiny specks)
+      const R0 = state.ballRadius;
+      const idealArea = Math.PI * R0 * R0;
+      const areaRatio = balls[i].area / idealArea;
+      if (areaRatio < 0.4 || areaRatio > 2.2) continue;
+      // Temporal stickiness: prefer a candidate close to previous cue ball
+      let temporal = 0;
+      if (state.cueBall && !state.cueManual) {
+        const dx = balls[i].x - state.cueBall.x;
+        const dy = balls[i].y - state.cueBall.y;
+        const d = Math.hypot(dx, dy);
+        temporal = Math.max(0, 80 - d); // bonus 0..80 inversely with distance
+      }
+      const score = bright - spread * 3 + temporal;
       if (score > bestScore) { bestScore = score; cueIdx = i; }
     }
     if (cueIdx >= 0) {
       balls[cueIdx].isCue = true;
-      // Auto-track cue ball to whitest blob — keeps the aim up-to-date as the
-      // live game progresses. If the user explicitly picked a cue ball via the
-      // "Escolher branca" button we respect that choice (cueManual=true).
       if (!state.cueManual) {
         state.cueBall = { x: balls[cueIdx].x, y: balls[cueIdx].y };
       }
@@ -818,11 +847,129 @@
     state.lastDetection = { ts: Date.now(), count: balls.length, error: null };
     updateStatusLine();
 
+    // Detect the cue stick direction: non-felt pixels minus ball regions,
+    // close to the cue ball. This lets the aim line follow the player's cue.
+    if (state.cueBall) detectCueStick(data, W, H, minX, maxX, minY, maxY, balls);
+
     // If user already has a target ball picked, re-snap it to nearest
     // detected blob so the aim line follows moving balls.
     if (state.targetBall) {
       const snapped = snapToDetected(state.targetBall);
       if (snapped) state.targetBall = snapped;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Cue stick detection                                                */
+  /*   1. Build a mask of non-felt pixels minus ball regions            */
+  /*   2. Find pixels within a window around the cue ball (e.g. 250px)  */
+  /*   3. Exclude a small disk right at the cue ball so the ball        */
+  /*      itself doesn't skew the center-of-mass                        */
+  /*   4. Center of mass of remaining = cue stick body                  */
+  /*   5. Direction = (cueBall - stickCenter), normalised               */
+  /* ------------------------------------------------------------------ */
+  function detectCueStick(data, W, H, minX, maxX, minY, maxY, balls) {
+    const cue = state.cueBall;
+    const R = state.ballRadius;
+    const searchR = Math.max(120, R * 12); // 12x ball radius search window
+    const excludeR = R * 1.6; // mask out the cue ball itself
+    const ballExcludeR = R * 1.3; // mask out other balls
+    const xMin = Math.max(minX, Math.floor(cue.x - searchR));
+    const xMax = Math.min(maxX, Math.ceil(cue.x + searchR));
+    const yMin = Math.max(minY, Math.floor(cue.y - searchR));
+    const yMax = Math.min(maxY, Math.ceil(cue.y + searchR));
+
+    // Precompute ball centers to avoid repeated array scans
+    const ballsArr = balls;
+
+    let sumX = 0, sumY = 0, count = 0;
+    let farX = 0, farY = 0, farDist = -1;
+    const r2 = searchR * searchR;
+    const ex2 = excludeR * excludeR;
+    const be2 = ballExcludeR * ballExcludeR;
+
+    for (let y = yMin; y <= yMax; y++) {
+      for (let x = xMin; x <= xMax; x++) {
+        const ddx = x - cue.x, ddy = y - cue.y;
+        const d2 = ddx * ddx + ddy * ddy;
+        if (d2 > r2) continue;
+        if (d2 < ex2) continue; // skip the cue ball itself
+        const i = (y * W + x) * 4;
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        // Not felt: green not dominant
+        if (g > r + 12 && g > b + 12 && g > 40) continue;
+        // Skip any ball area
+        let inBall = false;
+        for (let k = 0; k < ballsArr.length; k++) {
+          const bb = ballsArr[k];
+          if (bb.isCue) continue; // already excluded by ex2
+          const dx2 = x - bb.x, dy2 = y - bb.y;
+          if (dx2 * dx2 + dy2 * dy2 < be2) { inBall = true; break; }
+        }
+        if (inBall) continue;
+        // Cue stick pixel candidate
+        sumX += x; sumY += y; count++;
+        if (d2 > farDist) { farDist = d2; farX = x; farY = y; }
+      }
+    }
+
+    if (count < 40) {
+      state.cueStick = null;
+      return;
+    }
+    const cmx = sumX / count, cmy = sumY / count;
+    // Direction from stick center-of-mass toward the cue ball (unit vector).
+    let dx = cue.x - cmx, dy = cue.y - cmy;
+    const norm = Math.hypot(dx, dy) || 1;
+    dx /= norm; dy /= norm;
+    state.cueStick = {
+      cmx, cmy,
+      dx, dy,
+      count,
+      farX, farY,
+    };
+    // If no manual target ball, auto-pick the ball the cue is aiming at.
+    autoPickTargetAlongCue();
+  }
+
+  /* Given cue ball + cue stick direction, cast a ray and pick the
+   * first detected ball whose center is close to the ray. Then
+   * compute best pocket automatically. */
+  function autoPickTargetAlongCue() {
+    if (!state.cueBall || !state.cueStick || state.targetManual) return;
+    if (!state.detectedBalls || state.detectedBalls.length === 0) return;
+    const { dx, dy } = state.cueStick;
+    const cue = state.cueBall;
+    const R = state.ballRadius;
+    const maxDev = R * 1.4; // how far a ball center can be from the ray
+    let best = null, bestT = Infinity;
+    for (const b of state.detectedBalls) {
+      if (b.isCue) continue;
+      // Project ball center on the ray from cue along (dx,dy)
+      const rx = b.x - cue.x, ry = b.y - cue.y;
+      const t = rx * dx + ry * dy; // along-ray distance
+      if (t < R) continue; // behind or overlapping cue
+      const perp = Math.abs(rx * (-dy) + ry * dx);
+      if (perp > maxDev) continue;
+      if (t < bestT) { bestT = t; best = b; }
+    }
+    if (best) {
+      state.targetBall = { x: best.x, y: best.y };
+      if (state.pockets.length === 6) {
+        state.targetPocket = findBestPocket(
+          state.cueBall,
+          state.targetBall,
+          state.pockets,
+          state.ballRadius
+        );
+      }
+    } else {
+      // No ball along the cue line — clear auto target so we can draw the
+      // long straight "cue extension" line instead.
+      if (!state.targetManual) {
+        state.targetBall = null;
+        state.targetPocket = null;
+      }
     }
   }
 
@@ -977,32 +1124,32 @@
       ctx.restore();
     }
 
-    // Pockets
+    // Pockets — draw as thin dark-red rings to avoid being re-captured
+    // as white blobs during screenshot-based ball detection.
     if (state.pockets.length === 6) {
       for (const p of state.pockets) {
         const c = gameToCss(p);
         ctx.save();
-        ctx.fillStyle = 'rgba(255,255,255,0.2)';
-        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(255,80,80,0.6)';
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.arc(c.x, c.y, 9, 0, Math.PI * 2);
         ctx.stroke();
         ctx.restore();
       }
     }
 
-    // Detected balls
+    // Detected balls — outline-only to avoid contaminating the next
+    // captureVisibleTab pass with white/colored blobs.
     if (state.detectedBalls && state.detectedBalls.length) {
       for (const b of state.detectedBalls) {
         const c = gameToCss(b);
         ctx.save();
-        ctx.strokeStyle = b.isCue ? '#ffffff' : 'rgba(255,255,255,0.35)';
-        ctx.lineWidth = b.isCue ? 2 : 1;
+        ctx.strokeStyle = b.isCue ? '#ffe600' : 'rgba(0,200,255,0.7)';
+        ctx.lineWidth = b.isCue ? 2 : 1.2;
         ctx.beginPath();
         const rCss = b.r * (state.overlay.clientWidth / state.gameCanvas.width);
-        ctx.arc(c.x, c.y, Math.max(6, rCss), 0, Math.PI * 2);
+        ctx.arc(c.x, c.y, Math.max(4, rCss), 0, Math.PI * 2);
         ctx.stroke();
         ctx.restore();
       }
@@ -1033,13 +1180,11 @@
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Ghost ball circle
+      // Ghost ball circle (outline only to avoid self-capture)
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-      ctx.fillStyle = 'rgba(255,255,255,0.08)';
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(gho.x, gho.y, rCss, 0, Math.PI * 2);
-      ctx.fill();
       ctx.stroke();
 
       // Target -> pocket
@@ -1063,11 +1208,41 @@
       ctx.arc(tgt.x, tgt.y, rCss + 2, 0, Math.PI * 2);
       ctx.stroke();
 
-      ctx.fillStyle = 'rgba(63,185,80,0.6)';
+      ctx.strokeStyle = 'rgba(63,185,80,0.9)';
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(poc.x, poc.y, 8, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.arc(poc.x, poc.y, 9, 0, Math.PI * 2);
+      ctx.stroke();
 
+      ctx.restore();
+    } else if (state.cueBall && state.cueStick) {
+      // No target ball along the cue line: draw a long "cue extension" line
+      // from the cue ball going in the cue stick's direction so the user can
+      // see where the cue is currently pointing.
+      const cue = gameToCss(state.cueBall);
+      const { dx, dy } = state.cueStick;
+      // Convert direction to CSS (same scale for x & y since game canvas
+      // is sampled isotropically)
+      const rect = getCanvasRectInTopFrame(state.gameCanvas);
+      const sx = rect.width / state.gameCanvas.width;
+      const sy = rect.height / state.gameCanvas.height;
+      const ex = cue.x + dx * sx * 2000;
+      const ey = cue.y + dy * sy * 2000;
+      const rCss = state.ballRadius * sx;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(63,185,80,0.9)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.moveTo(cue.x, cue.y);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cue.x, cue.y, rCss + 2, 0, Math.PI * 2);
+      ctx.stroke();
       ctx.restore();
     } else {
       // Show selection-in-progress markers
