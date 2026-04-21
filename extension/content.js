@@ -935,7 +935,15 @@
 
     // Detect the cue stick direction: non-felt pixels minus ball regions,
     // close to the cue ball. This lets the aim line follow the player's cue.
-    if (state.cueBall) detectCueStick(data, W, H, minX, maxX, minY, maxY, balls);
+    if (state.cueBall) detectCueStick(data, W, H, balls);
+
+    // If the cue stick detection failed (e.g. player not currently aiming
+    // or pixels too noisy), clear any auto-picked target so we don't keep
+    // an obsolete aim line pointing at an old target.
+    if (!state.cueStick && !state.targetManual) {
+      state.targetBall = null;
+      state.targetPocket = null;
+    }
 
     // If user already has a target ball picked, re-snap it to nearest
     // detected blob so the aim line follows moving balls.
@@ -946,34 +954,63 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Cue stick detection                                                */
-  /*   1. Build a mask of non-felt pixels minus ball regions            */
-  /*   2. Find pixels within a window around the cue ball (e.g. 250px)  */
-  /*   3. Exclude a small disk right at the cue ball so the ball        */
-  /*      itself doesn't skew the center-of-mass                        */
-  /*   4. Center of mass of remaining = cue stick body                  */
-  /*   5. Direction = (cueBall - stickCenter), normalised               */
+  /* Cue stick detection (PCA-based)                                    */
+  /*   1. Collect non-felt pixels near the cue ball, within the table   */
+  /*      polygon PLUS a rail margin (so we see the stick body that     */
+  /*      hangs over the cushions).                                     */
+  /*   2. Fit a line through the pixel cluster using Principal          */
+  /*      Component Analysis. The dominant eigenvector of the 2x2       */
+  /*      covariance matrix is the cue stick's axis — this is robust to */
+  /*      scattered noise pixels which don't align with the axis.       */
+  /*   3. Require elongation (lambda1/lambda2 > 2) to confirm it's      */
+  /*      actually a stick-shaped cluster, not a blob.                  */
+  /*   4. Use the sign of (cueBall - CoM) projected on the axis to pick */
+  /*      the correct direction (toward the stick tip, away from butt). */
   /* ------------------------------------------------------------------ */
-  function detectCueStick(data, W, H, minX, maxX, minY, maxY, balls) {
+  function distToPolySq(x, y, poly) {
+    let minD2 = Infinity;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      const abx = b.x - a.x, aby = b.y - a.y;
+      const apx = x - a.x, apy = y - a.y;
+      const ab2 = abx * abx + aby * aby;
+      if (ab2 === 0) continue;
+      let t = (apx * abx + apy * aby) / ab2;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      const cx = a.x + t * abx, cy = a.y + t * aby;
+      const ddx = x - cx, ddy = y - cy;
+      const d2 = ddx * ddx + ddy * ddy;
+      if (d2 < minD2) minD2 = d2;
+    }
+    return minD2;
+  }
+
+  function detectCueStick(data, W, H, balls) {
     const cue = state.cueBall;
     const R = state.ballRadius;
-    // Search window: 10x ball radius — big enough to see the shaft, small
-    // enough to avoid grabbing far-off UI pixels when the cue ball is near
-    // a rail.
-    const searchR = Math.max(100, R * 10);
-    const excludeR = R * 1.6; // mask out the cue ball itself
-    const ballExcludeR = R * 1.3; // mask out other balls
-    const xMin = Math.max(minX, Math.floor(cue.x - searchR));
-    const xMax = Math.min(maxX, Math.ceil(cue.x + searchR));
-    const yMin = Math.max(minY, Math.floor(cue.y - searchR));
-    const yMax = Math.min(maxY, Math.ceil(cue.y + searchR));
+    // Bigger search window again: we now allow pixels beyond the polygon
+    // so the stick butt (outside the table over the rail) contributes.
+    const searchR = Math.max(160, R * 14);
+    const excludeR = R * 1.7; // mask the cue ball + its immediate halo
+    const ballExcludeR = R * 1.3; // mask other balls
+    const RAIL_MARGIN = Math.max(40, Math.round(R * 4)); // allow this many px outside polygon
+    const RAIL_MARGIN2 = RAIL_MARGIN * RAIL_MARGIN;
 
-    // Precompute ball centers to avoid repeated array scans
+    const xMin = Math.max(0, Math.floor(cue.x - searchR));
+    const xMax = Math.min(W - 1, Math.ceil(cue.x + searchR));
+    const yMin = Math.max(0, Math.floor(cue.y - searchR));
+    const yMax = Math.min(H - 1, Math.ceil(cue.y + searchR));
+
     const ballsArr = balls;
     const poly = state.corners;
+    const havePoly = poly.length === 4;
 
-    let sumX = 0, sumY = 0, count = 0;
-    let farX = 0, farY = 0, farDist = -1;
+    // Running sums for PCA (single-pass, no arrays needed).
+    let sumX = 0, sumY = 0;
+    let sumXX = 0, sumYY = 0, sumXY = 0;
+    let count = 0;
+
     const r2 = searchR * searchR;
     const ex2 = excludeR * excludeR;
     const be2 = ballExcludeR * ballExcludeR;
@@ -983,56 +1020,110 @@
         const ddx = x - cue.x, ddy = y - cue.y;
         const d2 = ddx * ddx + ddy * ddy;
         if (d2 > r2) continue;
-        if (d2 < ex2) continue; // skip the cue ball itself
-        // CRITICAL: only consider pixels INSIDE the table polygon. Without
-        // this, when the cue ball is near a rail, our own side panel (dark
-        // gray), the wooden rails, chat boxes and other UI get counted as
-        // "cue stick pixels" and drag the center-of-mass in the wrong
-        // direction, making the aim line point backwards.
-        if (poly.length === 4 && !pointInPoly(x, y, poly)) continue;
+        if (d2 < ex2) continue;
+
+        // Polygon filter with rail margin. Inside polygon -> accept.
+        // Outside polygon but within RAIL_MARGIN of an edge -> accept
+        // (captures cue stick butt that hangs over the rails).
+        // Further out -> reject (filters side panel, chat, scoreboard).
+        let inside = true;
+        if (havePoly) {
+          inside = pointInPoly(x, y, poly);
+          if (!inside) {
+            if (distToPolySq(x, y, poly) > RAIL_MARGIN2) continue;
+          }
+        }
+
         const i = (y * W + x) * 4;
         const r = data[i], g = data[i + 1], b = data[i + 2];
-        // Not felt: green not dominant
+
+        // Not felt: green dominance
         if (g > r + 12 && g > b + 12 && g > 40) continue;
-        // Reject very dark pixels (panel, shadows, rails) — the cue stick
-        // body always has decent brightness even in the darker parts.
-        if (r + g + b < 90) continue;
+
+        // Brightness filter. Stricter outside the polygon to reject the
+        // dark side panel (#21262d ~ 116), chat backgrounds, etc.
+        const bright = r + g + b;
+        if (inside) {
+          if (bright < 90) continue;
+        } else {
+          if (bright < 150) continue;
+        }
+
         // Skip any ball area
         let inBall = false;
         for (let k = 0; k < ballsArr.length; k++) {
           const bb = ballsArr[k];
-          if (bb.isCue) continue; // already excluded by ex2
+          if (bb.isCue) continue;
           const dx2 = x - bb.x, dy2 = y - bb.y;
           if (dx2 * dx2 + dy2 * dy2 < be2) { inBall = true; break; }
         }
         if (inBall) continue;
-        // Cue stick pixel candidate
-        sumX += x; sumY += y; count++;
-        if (d2 > farDist) { farDist = d2; farX = x; farY = y; }
+
+        // Accumulate for PCA
+        sumX += x; sumY += y;
+        sumXX += x * x; sumYY += y * y; sumXY += x * y;
+        count++;
       }
     }
 
-    if (count < 40) {
+    if (count < 60) {
       state.cueStick = null;
       return;
     }
+
     const cmx = sumX / count, cmy = sumY / count;
-    // Direction from stick center-of-mass toward the cue ball (unit vector).
-    let dx = cue.x - cmx, dy = cue.y - cmy;
-    const dist = Math.hypot(dx, dy);
-    // Ambiguity guard: if the center-of-mass is essentially on top of the
-    // cue ball (distance under half a ball), direction is unreliable — drop
-    // the stick reading rather than showing a random aim.
-    if (dist < R * 0.5) {
+    // Covariance (central moments)
+    const Sxx = sumXX / count - cmx * cmx;
+    const Syy = sumYY / count - cmy * cmy;
+    const Sxy = sumXY / count - cmx * cmy;
+
+    // Eigenvalues of [[Sxx,Sxy],[Sxy,Syy]]
+    const tr = Sxx + Syy;
+    const disc = Math.max(0, (tr * tr) / 4 - (Sxx * Syy - Sxy * Sxy));
+    const sqrtDisc = Math.sqrt(disc);
+    const lambda1 = tr / 2 + sqrtDisc; // principal (stick axis) variance
+    const lambda2 = Math.max(0.0001, tr / 2 - sqrtDisc); // perpendicular variance
+
+    // Shape check: stick must be elongated. Ratio < 2 -> blob-like, drop.
+    const elongation = lambda1 / lambda2;
+    if (elongation < 2.0) {
       state.cueStick = null;
       return;
     }
-    dx /= dist; dy /= dist;
+
+    // Eigenvector for lambda1 (principal axis direction)
+    let vx, vy;
+    if (Math.abs(Sxy) > 1e-6) {
+      vx = lambda1 - Syy;
+      vy = Sxy;
+    } else if (Sxx >= Syy) {
+      vx = 1; vy = 0;
+    } else {
+      vx = 0; vy = 1;
+    }
+    const n = Math.hypot(vx, vy) || 1;
+    vx /= n; vy /= n;
+
+    // Orient the axis so it points FROM the stick body TOWARD the cue ball
+    // (i.e. the shot direction). Project (cue - cm) onto v: if positive, v
+    // already points toward the ball; else flip.
+    const proj = (cue.x - cmx) * vx + (cue.y - cmy) * vy;
+    if (proj < 0) { vx = -vx; vy = -vy; }
+
+    // Sanity: CoM must be meaningfully offset from the cue ball, otherwise
+    // the direction is noise (e.g. tiny fragment of stick visible).
+    const cmDist = Math.hypot(cue.x - cmx, cue.y - cmy);
+    if (cmDist < R * 0.4) {
+      state.cueStick = null;
+      return;
+    }
+
     state.cueStick = {
       cmx, cmy,
-      dx, dy,
+      dx: vx, dy: vy,
       count,
-      farX, farY,
+      farX: cmx, farY: cmy, // kept for backwards compat with renderer
+      elongation,
     };
     // If no manual target ball, auto-pick the ball the cue is aiming at.
     autoPickTargetAlongCue();
