@@ -22,10 +22,11 @@
     // Calibration (in game canvas pixel coords)
     corners: [], // [TL, TR, BR, BL]
     pockets: [], // derived: 4 corners + 2 side mids
-    ballRadius: 16, // pixels in game canvas space
+    ballRadius: 22, // pixels in game canvas space
     // Selection
     mode: 'idle', // 'calibrate' | 'select-cue' | 'select-target' | 'select-pocket' | 'idle'
     cueBall: null,
+    cueManual: false,
     targetBall: null,
     targetPocket: null,
     detectedBalls: [],
@@ -144,6 +145,7 @@
 
   function teardown() {
     stopLoop();
+    stopContinuousDetection();
     if (state._canvasPoll) { clearInterval(state._canvasPoll); state._canvasPoll = null; }
     if (state.overlay && state.overlay.parentNode) {
       state.overlay.parentNode.removeChild(state.overlay);
@@ -391,19 +393,29 @@
         if (state.corners.length !== 4) return setHint('Calibre a mesa antes de detectar bolas.');
         try {
           detectBalls();
-          setHint(`Detectadas ${state.detectedBalls.length} bolas. Agora clique em "Escolher branca" / "alvo".`);
+          startContinuousDetection();
+          setHint(`Detectadas ${state.detectedBalls.length} bolas. Clique numa bola ALVO para ver a mira automatica.`);
+          // Enter select-target mode for one-click aim
+          state.mode = 'select-target';
+          enableInteractive(true);
         } catch (e) {
           console.warn(e);
-          setHint('Falha na detecção (canvas pode ter CORS). Use seleção manual.');
+          setHint('Falha na deteccao (canvas pode ter CORS). Use selecao manual.');
         }
         break;
       case 'clear':
         state.cueBall = null;
         state.targetBall = null;
         state.targetPocket = null;
+        state.cueManual = false;
         state.mode = 'idle';
         enableInteractive(false);
-        setHint('Seleção limpa. Escolha bola branca, alvo e caçapa novamente.');
+        setHint('Seleção limpa. Clique numa bola ALVO para mira automatica.');
+        // re-enter select-target for one-click aim
+        if (state.corners.length === 4) {
+          state.mode = 'select-target';
+          enableInteractive(true);
+        }
         break;
       case 'reset':
         state.corners = [];
@@ -412,8 +424,10 @@
         state.targetBall = null;
         state.targetPocket = null;
         state.detectedBalls = [];
+        state.cueManual = false;
         state.mode = 'idle';
         enableInteractive(false);
+        stopContinuousDetection();
         saveCalibration();
         setHint('Tudo resetado. Clique em "Calibrar" para comecar.');
         break;
@@ -443,21 +457,49 @@
         state.mode = 'idle';
         enableInteractive(false);
         saveCalibration();
-        setHint('Mesa calibrada! Agora clique em "Escolher branca".');
+        // Auto-run detection + start continuous detection loop
+        try {
+          detectBalls();
+          setHint(`Mesa calibrada! ${state.detectedBalls.length} bolas detectadas. Agora clique na BOLA ALVO que quer encaçapar — a caçapa será escolhida automaticamente.`);
+        } catch (e) {
+          setHint('Mesa calibrada, mas detecao falhou. Clique "Detectar bolas" ou selecione manualmente.');
+        }
+        startContinuousDetection();
+        // Auto-enter select-target mode so next click picks target ball
+        state.mode = 'select-target';
+        enableInteractive(true);
       } else {
         const labels = ['sup-dir', 'inf-dir', 'inf-esq'];
         setHint(`Canto ${state.corners.length}/4 marcado. Clique em ${labels[state.corners.length - 1]}.`);
       }
     } else if (state.mode === 'select-cue') {
       state.cueBall = snapToDetected(pt) || pt;
+      state.cueManual = true;
       state.mode = 'idle';
       enableInteractive(false);
       setHint('Bola branca selecionada. Agora clique em "Escolher alvo".');
     } else if (state.mode === 'select-target') {
       state.targetBall = snapToDetected(pt) || pt;
+      // Auto-pick best pocket (min cut angle) if we have cue ball + pockets
+      if (state.cueBall && state.pockets.length === 6) {
+        state.targetPocket = findBestPocket(
+          state.cueBall,
+          state.targetBall,
+          state.pockets,
+          state.ballRadius
+        );
+      }
       state.mode = 'idle';
       enableInteractive(false);
-      setHint('Bola alvo selecionada. Agora clique em "Escolher caçapa".');
+      if (state.targetPocket) {
+        setHint('Mira pronta! Caçapa escolhida automaticamente. Clique em outra bola para recalcular, ou "Limpar seleção".');
+      } else {
+        setHint('Alvo selecionado. Agora clique em "Escolher caçapa" ou em uma caçapa.');
+      }
+      // After first aim, re-enable target selection so subsequent clicks
+      // let the user quickly switch target balls without pressing buttons.
+      state.mode = 'select-target';
+      enableInteractive(true);
     } else if (state.mode === 'select-pocket') {
       // Snap to nearest pocket
       let best = null, bestD = Infinity;
@@ -507,7 +549,7 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Ball detection (simple color-blob inside table polygon)            */
+  /* Ball detection (green-dominance + flood-fill + circularity)        */
   /* ------------------------------------------------------------------ */
   function detectBalls() {
     const src = state.gameCanvas;
@@ -531,39 +573,34 @@
     let maxY = Math.min(H - 1, Math.ceil(Math.max(...poly.map((p) => p.y))));
 
     // Shrink a bit to avoid rails
-    const shrink = Math.round(state.ballRadius * 0.6);
+    const shrink = Math.round(state.ballRadius * 0.9);
     minX += shrink; maxX -= shrink; minY += shrink; maxY -= shrink;
+    if (minX >= maxX || minY >= maxY) { state.detectedBalls = []; return; }
 
-    // Sample felt color from center of table
-    const cx = Math.round((minX + maxX) / 2);
-    const cy = Math.round((minY + maxY) / 2);
-    let fr = 0, fg = 0, fb = 0, fc = 0;
-    for (let dy = -8; dy <= 8; dy += 2) {
-      for (let dx = -8; dx <= 8; dx += 2) {
-        const i = ((cy + dy) * W + (cx + dx)) * 4;
-        fr += data[i]; fg += data[i + 1]; fb += data[i + 2]; fc++;
-      }
+    // Green dominance heuristic — robust vs vignette, shadows and the
+    // translucent "SINUCADA.COM" logo watermark (still greenish).
+    function isFelt(i) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      // felt = green channel clearly dominates
+      return g > r + 12 && g > b + 12 && g > 40;
     }
-    fr /= fc; fg /= fc; fb /= fc;
 
-    // Mask: 1 if NOT felt AND inside polygon, 0 otherwise
+    // Mask: 1 if NOT felt AND inside polygon
     const mask = new Uint8Array(W * H);
-    const feltThresh = 55; // color distance threshold
     for (let y = minY; y <= maxY; y++) {
       for (let x = minX; x <= maxX; x++) {
         if (!pointInPoly(x, y, poly)) continue;
         const i = (y * W + x) * 4;
-        const dr = data[i] - fr, dg = data[i + 1] - fg, db = data[i + 2] - fb;
-        const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-        if (dist > feltThresh) mask[y * W + x] = 1;
+        if (!isFelt(i)) mask[y * W + x] = 1;
       }
     }
 
     // Connected components (BFS)
     const visited = new Uint8Array(W * H);
     const balls = [];
-    const minArea = Math.PI * (state.ballRadius * 0.5) ** 2;
-    const maxArea = Math.PI * (state.ballRadius * 1.7) ** 2;
+    const R0 = state.ballRadius;
+    const minArea = Math.PI * (R0 * 0.45) ** 2;
+    const maxArea = Math.PI * (R0 * 1.9) ** 2;
     const qx = new Int32Array(W * H);
     const qy = new Int32Array(W * H);
 
@@ -571,7 +608,6 @@
       for (let x = minX; x <= maxX; x++) {
         const idx = y * W + x;
         if (!mask[idx] || visited[idx]) continue;
-        // BFS
         let head = 0, tail = 0;
         qx[tail] = x; qy[tail] = y; tail++;
         visited[idx] = 1;
@@ -587,7 +623,6 @@
           if (cy2 > bbB) bbB = cy2;
           const pi = (cy2 * W + cx2) * 4;
           rSum += data[pi]; gSum += data[pi + 1]; bSum += data[pi + 2];
-          // neighbours
           if (cx2 > minX) {
             const ni = cy2 * W + (cx2 - 1);
             if (mask[ni] && !visited[ni]) { visited[ni] = 1; qx[tail] = cx2 - 1; qy[tail] = cy2; tail++; }
@@ -606,30 +641,115 @@
           }
         }
         if (area < minArea || area > maxArea) continue;
-        const w = bbR - bbL, h = bbB - bbT;
-        // must be roughly circular
+        const w = bbR - bbL + 1, h = bbB - bbT + 1;
         if (w === 0 || h === 0) continue;
         const aspect = Math.max(w / h, h / w);
-        if (aspect > 1.8) continue;
+        if (aspect > 1.7) continue; // rejects cue stick and elongated noise
+        // circularity: fill ratio of bounding circle
+        const rBB = Math.max(w, h) / 2;
+        const fill = area / (Math.PI * rBB * rBB);
+        if (fill < 0.45) continue; // rejects C-shapes / holes
         balls.push({
           x: sx2 / area,
           y: sy2 / area,
-          r: Math.max(w, h) / 2,
+          r: rBB,
           area,
           color: { r: rSum / area, g: gSum / area, b: bSum / area },
         });
       }
     }
 
-    // Mark cue ball = whitest blob
-    let whitest = null, whiteScore = -1;
-    for (const b of balls) {
-      const score = b.color.r + b.color.g + b.color.b - Math.abs(b.color.r - b.color.g) - Math.abs(b.color.g - b.color.b);
-      if (score > whiteScore) { whiteScore = score; whitest = b; }
+    // Auto-calibrate ballRadius to the median radius detected (gives
+    // better ghost ball sizing without the user touching the slider).
+    if (balls.length >= 3) {
+      const sorted = balls.map((b) => b.r).sort((a, b) => a - b);
+      const medR = sorted[Math.floor(sorted.length / 2)];
+      if (medR > 4 && medR < 80) {
+        state.ballRadius = Math.round(medR);
+        if (state.panel) {
+          const slider = state.panel.querySelector('[data-testid="radius-range"]');
+          const vs = state.panel.querySelector('[data-testid="radius-val"]');
+          if (slider) slider.value = state.ballRadius;
+          if (vs) vs.textContent = state.ballRadius;
+        }
+      }
     }
-    if (whitest) whitest.isCue = true;
+
+    // Whitest blob = cue ball. Score rewards high brightness AND low color spread.
+    let cueIdx = -1, bestScore = -Infinity;
+    for (let i = 0; i < balls.length; i++) {
+      const c = balls[i].color;
+      const bright = (c.r + c.g + c.b) / 3;
+      const spread = Math.max(c.r, c.g, c.b) - Math.min(c.r, c.g, c.b);
+      const score = bright - spread * 2;
+      if (score > bestScore) { bestScore = score; cueIdx = i; }
+    }
+    if (cueIdx >= 0) {
+      balls[cueIdx].isCue = true;
+      // Auto-track cue ball to whitest blob — keeps the aim up-to-date as the
+      // live game progresses. If the user explicitly picked a cue ball via the
+      // "Escolher branca" button we respect that choice (cueManual=true).
+      if (!state.cueManual) {
+        state.cueBall = { x: balls[cueIdx].x, y: balls[cueIdx].y };
+      }
+    }
 
     state.detectedBalls = balls;
+
+    // If user already has a target ball picked, re-snap it to nearest
+    // detected blob so the aim line follows moving balls.
+    if (state.targetBall) {
+      const snapped = snapToDetected(state.targetBall);
+      if (snapped) state.targetBall = snapped;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Best pocket auto-selection (min cut angle, rewards short distance) */
+  /* ------------------------------------------------------------------ */
+  function findBestPocket(cue, target, pockets, R) {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const p of pockets) {
+      const dx1 = p.x - target.x;
+      const dy1 = p.y - target.y;
+      const d1 = Math.hypot(dx1, dy1);
+      if (d1 < R * 2) continue;
+      const ghost = {
+        x: target.x - (2 * R * dx1) / d1,
+        y: target.y - (2 * R * dy1) / d1,
+      };
+      const dx2 = ghost.x - cue.x;
+      const dy2 = ghost.y - cue.y;
+      const d2 = Math.hypot(dx2, dy2);
+      if (d2 < R * 2) continue;
+      const cosCut = (dx1 * dx2 + dy1 * dy2) / (d1 * d2);
+      // cutAngle near 0 = straight shot (best); near pi/2 = very thin cut
+      const cutAngle = Math.acos(Math.max(-1, Math.min(1, cosCut)));
+      // Score: penalize big cut angle much more than distance
+      const score = -(cutAngle * 180) / Math.PI - (d1 + d2) / 400;
+      // Reject shots where the target ball would be hit on the wrong side
+      if (cosCut < 0.1) continue;
+      if (score > bestScore) { bestScore = score; best = p; }
+    }
+    return best;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Continuous detection loop                                          */
+  /* ------------------------------------------------------------------ */
+  function startContinuousDetection() {
+    if (state._detectInterval) return;
+    state._detectInterval = setInterval(() => {
+      if (!state.gameCanvas || state.corners.length !== 4) return;
+      try { detectBalls(); } catch (e) { /* silent */ }
+    }, 800);
+  }
+  function stopContinuousDetection() {
+    if (state._detectInterval) {
+      clearInterval(state._detectInterval);
+      state._detectInterval = null;
+    }
   }
 
   function pointInPoly(x, y, poly) {
