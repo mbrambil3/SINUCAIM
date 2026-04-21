@@ -22,7 +22,7 @@
     // Calibration (in game canvas pixel coords)
     corners: [], // [TL, TR, BR, BL]
     pockets: [], // derived: 4 corners + 2 side mids
-    ballRadius: 18, // pixels in game canvas space
+    ballRadius: 13, // pixels in game canvas space (auto-calibrated after detection)
     // Selection
     mode: 'idle', // 'calibrate' | 'select-cue' | 'select-target' | 'select-pocket' | 'idle'
     cueBall: null,
@@ -83,12 +83,13 @@
     state.gameCanvas = canvas;
     if (!state.overlay) mountOverlay();
     if (!state.rafId) startLoop();
-    // Preflight check: can we read pixels from the game canvas?
-    const preflight = canReadCanvasPixels(canvas);
-    if (preflight) {
-      setHint('Canvas detectado e leitura OK! Clique em "Calibrar" e marque os 4 cantos.');
+    // Preflight: if drawImage returns non-blank, great (fast path).
+    // Otherwise we will fall back to captureVisibleTab automatically.
+    const direct = canReadCanvasPixels(canvas);
+    if (direct) {
+      setHint('Canvas detectado (leitura direta OK). Clique em "Calibrar" e marque os 4 cantos.');
     } else {
-      setHint('ATENCAO: canvas detectado mas NAO consigo ler os pixels. RECARREGUE A PAGINA (F5) agora para ativar a leitura do WebGL.');
+      setHint('Canvas detectado (usando modo screenshot). Clique em "Calibrar" e marque os 4 cantos.');
     }
     return true;
   }
@@ -421,17 +422,18 @@
       case 'detect':
         if (!state.gameCanvas) return setHint('Canvas nao encontrado. Clique "Achar jogo".');
         if (state.corners.length !== 4) return setHint('Calibre a mesa antes de detectar bolas.');
-        try {
-          detectBalls();
-          startContinuousDetection();
-          setHint(`Detectadas ${state.detectedBalls.length} bolas. Clique numa bola ALVO para ver a mira automatica.`);
-          // Enter select-target mode for one-click aim
-          state.mode = 'select-target';
-          enableInteractive(true);
-        } catch (e) {
-          console.warn(e);
-          setHint('Falha na deteccao (canvas pode ter CORS). Use selecao manual.');
-        }
+        detectBalls()
+          .then(() => {
+            startContinuousDetection();
+            setHint(`Detectadas ${state.detectedBalls.length} bolas. Clique numa bola ALVO para mira automatica.`);
+            state.mode = 'select-target';
+            enableInteractive(true);
+          })
+          .catch((e) => {
+            state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
+            updateStatusLine();
+            setHint('Falha na deteccao: ' + (e.message || e));
+          });
         break;
       case 'clear':
         state.cueBall = null;
@@ -487,19 +489,17 @@
         state.mode = 'idle';
         enableInteractive(false);
         saveCalibration();
-        // Auto-run detection + start continuous detection loop
-        try {
-          detectBalls();
-          setHint(`Mesa calibrada! ${state.detectedBalls.length} bolas detectadas. Clique numa bola ALVO — caçapa escolhida automaticamente.`);
-        } catch (e) {
-          state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
-          updateStatusLine();
-          if (e.message === 'canvas_blank') {
-            setHint('Mesa calibrada MAS nao consigo ler o canvas. RECARREGUE A PAGINA (F5) agora e ative a mira novamente antes do jogo carregar.');
-          } else {
-            setHint('Mesa calibrada. Deteccao falhou: ' + e.message + '. Use selecao manual.');
-          }
-        }
+        setHint('Mesa calibrada! Detectando bolas...');
+        // Auto-run detection (async) + start continuous detection loop
+        detectBalls()
+          .then(() => {
+            setHint(`${state.detectedBalls.length} bolas detectadas. Clique numa bola ALVO para mira automatica.`);
+          })
+          .catch((e) => {
+            state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
+            updateStatusLine();
+            setHint('Mesa calibrada. Deteccao tentando via screenshot... aguarde alguns segundos.');
+          });
         startContinuousDetection();
         // Auto-enter select-target mode so next click picks target ball
         state.mode = 'select-target';
@@ -585,37 +585,104 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Pixel capture: drawImage fast-path, captureVisibleTab fallback     */
+  /* ------------------------------------------------------------------ */
+  async function getGameImageData() {
+    const src = state.gameCanvas;
+    if (!src) throw new Error('no_canvas');
+    const W = src.width, H = src.height;
+
+    // Fast path: drawImage (works only if WebGL preserveDrawingBuffer=true)
+    try {
+      const off = document.createElement('canvas');
+      off.width = W; off.height = H;
+      const octx = off.getContext('2d', { willReadFrequently: true });
+      octx.drawImage(src, 0, 0);
+      const img = octx.getImageData(0, 0, W, H);
+      const data = img.data;
+      let nonBlack = 0;
+      const stride = Math.max(4, ((data.length / 4 / 1500) | 0) * 4);
+      for (let i = 0; i < data.length; i += stride) {
+        if (data[i] + data[i + 1] + data[i + 2] > 30) {
+          nonBlack++;
+          if (nonBlack > 30) break;
+        }
+      }
+      if (nonBlack > 30) {
+        state._captureMode = 'direct';
+        return img;
+      }
+    } catch (e) { /* fall through */ }
+
+    // Fallback path: captureVisibleTab via service worker (compositor readback)
+    const resp = await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'capture' }, (r) => {
+          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+          else resolve(r);
+        });
+      } catch (e) { resolve({ ok: false, error: String(e) }); }
+    });
+    if (!resp || !resp.ok) throw new Error('capture_failed:' + (resp && resp.error));
+
+    const fullImg = await loadImage(resp.dataUrl);
+    const dpr = window.devicePixelRatio || 1;
+    const rect = getCanvasRectInTopFrame(src);
+    const off = document.createElement('canvas');
+    off.width = W; off.height = H;
+    const octx = off.getContext('2d', { willReadFrequently: true });
+    // Full canvas region in tab-screenshot pixels (may be partially off-viewport)
+    const srcLeft = rect.left * dpr;
+    const srcTop = rect.top * dpr;
+    const srcW = rect.width * dpr;
+    const srcH = rect.height * dpr;
+    const clipLeft = Math.max(0, -srcLeft);
+    const clipTop = Math.max(0, -srcTop);
+    const sx = Math.max(0, srcLeft);
+    const sy = Math.max(0, srcTop);
+    const sw = Math.max(1, Math.min(fullImg.naturalWidth - sx, srcW - clipLeft));
+    const sh = Math.max(1, Math.min(fullImg.naturalHeight - sy, srcH - clipTop));
+    const scaleX = W / srcW;
+    const scaleY = H / srcH;
+    const dx = clipLeft * scaleX;
+    const dy = clipTop * scaleY;
+    const dw = sw * scaleX;
+    const dh = sh * scaleY;
+    octx.fillStyle = '#000';
+    octx.fillRect(0, 0, W, H);
+    octx.drawImage(fullImg, sx, sy, sw, sh, dx, dy, dw, dh);
+    state._captureMode = 'capture';
+    return octx.getImageData(0, 0, W, H);
+  }
+
+  function loadImage(dataUrl) {
+    return new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = dataUrl;
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Ball detection (green-dominance + flood-fill + circularity)        */
   /* ------------------------------------------------------------------ */
-  function detectBalls() {
-    const src = state.gameCanvas;
-    if (!src) throw new Error('no game canvas');
+  async function detectBalls() {
+    if (!state.gameCanvas) throw new Error('no_canvas');
+    if (state.corners.length !== 4) throw new Error('not_calibrated');
+    if (state._detecting) return;
+    state._detecting = true;
+    try {
+      const img = await getGameImageData();
+      runDetection(img);
+    } finally {
+      state._detecting = false;
+    }
+  }
 
-    const off = document.createElement('canvas');
-    off.width = src.width;
-    off.height = src.height;
-    const octx = off.getContext('2d', { willReadFrequently: true });
-    // drawImage on a webgl canvas requires preserveDrawingBuffer (patched in inject.js)
-    octx.drawImage(src, 0, 0);
-    const img = octx.getImageData(0, 0, off.width, off.height);
+  function runDetection(img) {
     const data = img.data;
     const W = img.width, H = img.height;
-
-    // Sanity check: if the WebGL canvas was created without
-    // preserveDrawingBuffer=true (inject.js did not patch in time), drawImage
-    // returns a transparent/black frame. Detect and bail out with a clear
-    // message so the user knows to refresh the page.
-    let nonBlackSamples = 0;
-    const stride = Math.max(4, (data.length / 4 / 2000) | 0) * 4;
-    for (let i = 0; i < data.length; i += stride) {
-      if (data[i] + data[i + 1] + data[i + 2] > 30) {
-        nonBlackSamples++;
-        if (nonBlackSamples > 40) break;
-      }
-    }
-    if (nonBlackSamples < 40) {
-      throw new Error('canvas_blank');
-    }
 
     // Bounding box of the table polygon
     const poly = state.corners;
@@ -718,6 +785,7 @@
       const medR = sorted[Math.floor(sorted.length / 2)];
       if (medR > 4 && medR < 80) {
         state.ballRadius = Math.round(medR);
+        saveCalibration();
         if (state.panel) {
           const slider = state.panel.querySelector('[data-testid="radius-range"]');
           const vs = state.panel.querySelector('[data-testid="radius-val"]');
@@ -764,14 +832,15 @@
     if (!el) return;
     const d = state.lastDetection;
     const age = d.ts ? Math.floor((Date.now() - d.ts) / 100) / 10 : '—';
-    if (d.error === 'canvas_blank') {
-      el.textContent = 'ERRO: canvas em branco. RECARREGUE A PAGINA (F5) com a extensao ja ativa.';
+    const mode = state._captureMode === 'direct' ? 'direct' : (state._captureMode === 'capture' ? 'screenshot' : '?');
+    if (d.error && d.error.indexOf('capture_failed') === 0) {
+      el.textContent = 'Erro captura: ' + d.error;
       el.style.color = '#ff7b72';
-    } else if (d.error) {
+    } else if (d.error && d.error !== 'not_calibrated') {
       el.textContent = 'Erro: ' + d.error;
       el.style.color = '#ff7b72';
     } else if (d.ts) {
-      el.textContent = `Bolas: ${d.count} | Raio: ${state.ballRadius}px | Scan: ${age}s atras`;
+      el.textContent = `Bolas: ${d.count} | Raio: ${state.ballRadius}px | Modo: ${mode} | ${age}s atras`;
       el.style.color = d.count > 0 ? '#3fb950' : '#d29922';
     } else {
       el.textContent = 'Aguardando deteccao...';
@@ -815,15 +884,15 @@
   /* ------------------------------------------------------------------ */
   function startContinuousDetection() {
     if (state._detectInterval) return;
-    state._detectInterval = setInterval(() => {
+    state._detectInterval = setInterval(async () => {
       if (!state.gameCanvas || state.corners.length !== 4) return;
       try {
-        detectBalls();
+        await detectBalls();
       } catch (e) {
         state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
         updateStatusLine();
       }
-    }, 400);
+    }, 700); // 700ms is safe under captureVisibleTab rate limit (~2/sec)
   }
   function stopContinuousDetection() {
     if (state._detectInterval) {

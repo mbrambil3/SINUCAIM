@@ -3,7 +3,7 @@
   "name": "Sinucada Aim Helper",
   "version": "1.0.0",
   "description": "Auxiliar de mira (ghost ball) para estudo de geometria/fisica em partidas de treino na Sinucada.",
-  "permissions": ["storage", "activeTab", "scripting"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://sinucada.com/*",
     "https://*.sinucada.com/*"
