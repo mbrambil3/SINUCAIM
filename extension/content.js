@@ -22,7 +22,7 @@
     // Calibration (in game canvas pixel coords)
     corners: [], // [TL, TR, BR, BL]
     pockets: [], // derived: 4 corners + 2 side mids
-    ballRadius: 22, // pixels in game canvas space
+    ballRadius: 18, // pixels in game canvas space
     // Selection
     mode: 'idle', // 'calibrate' | 'select-cue' | 'select-target' | 'select-pocket' | 'idle'
     cueBall: null,
@@ -31,6 +31,7 @@
     targetPocket: null,
     detectedBalls: [],
     rafId: null,
+    lastDetection: { ts: 0, count: 0, error: null },
   };
 
   /* ------------------------------------------------------------------ */
@@ -82,8 +83,33 @@
     state.gameCanvas = canvas;
     if (!state.overlay) mountOverlay();
     if (!state.rafId) startLoop();
-    setHint('Canvas detectado! Clique em "Calibrar" e marque os 4 cantos da mesa.');
+    // Preflight check: can we read pixels from the game canvas?
+    const preflight = canReadCanvasPixels(canvas);
+    if (preflight) {
+      setHint('Canvas detectado e leitura OK! Clique em "Calibrar" e marque os 4 cantos.');
+    } else {
+      setHint('ATENCAO: canvas detectado mas NAO consigo ler os pixels. RECARREGUE A PAGINA (F5) agora para ativar a leitura do WebGL.');
+    }
     return true;
+  }
+
+  // Quick 8x8 sample test — true if drawImage actually copies content.
+  function canReadCanvasPixels(canvas) {
+    try {
+      const s = 8;
+      const off = document.createElement('canvas');
+      off.width = s; off.height = s;
+      const o = off.getContext('2d', { willReadFrequently: true });
+      o.drawImage(canvas, 0, 0, s, s);
+      const d = o.getImageData(0, 0, s, s).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        sum += d[i] + d[i + 1] + d[i + 2];
+      }
+      return sum > 50; // non-blank
+    } catch (e) {
+      return false;
+    }
   }
 
   function findGameCanvas() {
@@ -239,6 +265,10 @@
           <span>Raio:</span>
           <input type="range" min="6" max="40" step="1" value="${state.ballRadius}" data-testid="radius-range" />
           <span data-testid="radius-val">${state.ballRadius}</span>
+        </div>
+
+        <div class="sa-hint" data-testid="status-line" style="font-size:11px;padding:6px 8px;border:1px solid #30363d;border-radius:6px;background:rgba(0,0,0,0.3);">
+          Aguardando deteccao...
         </div>
 
         <div class="sa-actions">
@@ -460,9 +490,15 @@
         // Auto-run detection + start continuous detection loop
         try {
           detectBalls();
-          setHint(`Mesa calibrada! ${state.detectedBalls.length} bolas detectadas. Agora clique na BOLA ALVO que quer encaçapar — a caçapa será escolhida automaticamente.`);
+          setHint(`Mesa calibrada! ${state.detectedBalls.length} bolas detectadas. Clique numa bola ALVO — caçapa escolhida automaticamente.`);
         } catch (e) {
-          setHint('Mesa calibrada, mas detecao falhou. Clique "Detectar bolas" ou selecione manualmente.');
+          state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
+          updateStatusLine();
+          if (e.message === 'canvas_blank') {
+            setHint('Mesa calibrada MAS nao consigo ler o canvas. RECARREGUE A PAGINA (F5) agora e ative a mira novamente antes do jogo carregar.');
+          } else {
+            setHint('Mesa calibrada. Deteccao falhou: ' + e.message + '. Use selecao manual.');
+          }
         }
         startContinuousDetection();
         // Auto-enter select-target mode so next click picks target ball
@@ -564,6 +600,22 @@
     const img = octx.getImageData(0, 0, off.width, off.height);
     const data = img.data;
     const W = img.width, H = img.height;
+
+    // Sanity check: if the WebGL canvas was created without
+    // preserveDrawingBuffer=true (inject.js did not patch in time), drawImage
+    // returns a transparent/black frame. Detect and bail out with a clear
+    // message so the user knows to refresh the page.
+    let nonBlackSamples = 0;
+    const stride = Math.max(4, (data.length / 4 / 2000) | 0) * 4;
+    for (let i = 0; i < data.length; i += stride) {
+      if (data[i] + data[i + 1] + data[i + 2] > 30) {
+        nonBlackSamples++;
+        if (nonBlackSamples > 40) break;
+      }
+    }
+    if (nonBlackSamples < 40) {
+      throw new Error('canvas_blank');
+    }
 
     // Bounding box of the table polygon
     const poly = state.corners;
@@ -695,12 +747,35 @@
     }
 
     state.detectedBalls = balls;
+    state.lastDetection = { ts: Date.now(), count: balls.length, error: null };
+    updateStatusLine();
 
     // If user already has a target ball picked, re-snap it to nearest
     // detected blob so the aim line follows moving balls.
     if (state.targetBall) {
       const snapped = snapToDetected(state.targetBall);
       if (snapped) state.targetBall = snapped;
+    }
+  }
+
+  function updateStatusLine() {
+    if (!state.panel) return;
+    const el = state.panel.querySelector('[data-testid="status-line"]');
+    if (!el) return;
+    const d = state.lastDetection;
+    const age = d.ts ? Math.floor((Date.now() - d.ts) / 100) / 10 : '—';
+    if (d.error === 'canvas_blank') {
+      el.textContent = 'ERRO: canvas em branco. RECARREGUE A PAGINA (F5) com a extensao ja ativa.';
+      el.style.color = '#ff7b72';
+    } else if (d.error) {
+      el.textContent = 'Erro: ' + d.error;
+      el.style.color = '#ff7b72';
+    } else if (d.ts) {
+      el.textContent = `Bolas: ${d.count} | Raio: ${state.ballRadius}px | Scan: ${age}s atras`;
+      el.style.color = d.count > 0 ? '#3fb950' : '#d29922';
+    } else {
+      el.textContent = 'Aguardando deteccao...';
+      el.style.color = '#8b949e';
     }
   }
 
@@ -742,8 +817,13 @@
     if (state._detectInterval) return;
     state._detectInterval = setInterval(() => {
       if (!state.gameCanvas || state.corners.length !== 4) return;
-      try { detectBalls(); } catch (e) { /* silent */ }
-    }, 800);
+      try {
+        detectBalls();
+      } catch (e) {
+        state.lastDetection = { ts: Date.now(), count: 0, error: e.message || String(e) };
+        updateStatusLine();
+      }
+    }, 400);
   }
   function stopContinuousDetection() {
     if (state._detectInterval) {
