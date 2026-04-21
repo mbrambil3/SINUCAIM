@@ -40,15 +40,46 @@
   /* ------------------------------------------------------------------ */
   /* Init / messaging                                                   */
   /* ------------------------------------------------------------------ */
+  // localStorage is per-domain and survives extension reinstalls, so we
+  // mirror the calibration into the sinucada.com page's localStorage
+  // as a recoverable backup. chrome.storage.local remains primary.
+  const LS_KEY = 'sinucadaAimCalibration_v2';
+  function readLocalStorageCalib() {
+    try {
+      const raw = window.localStorage.getItem(LS_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.corners)) return null;
+      return parsed;
+    } catch (e) { return null; }
+  }
+  function writeLocalStorageCalib(calib) {
+    try { window.localStorage.setItem(LS_KEY, JSON.stringify(calib)); }
+    catch (e) { /* storage may be disabled */ }
+  }
+  function applyCalib(c) {
+    if (!c) return false;
+    if (Array.isArray(c.corners) && c.corners.length === 4) state.corners = c.corners;
+    else return false;
+    if (Array.isArray(c.pockets) && c.pockets.length === 6) state.pockets = c.pockets;
+    if (typeof c.ballRadius === 'number') state.ballRadius = c.ballRadius;
+    if (c.ballRadiusManual === true) state.ballRadiusManual = true;
+    return true;
+  }
+
   chrome.storage.local.get([STORAGE_KEY, CALIB_KEY], (res) => {
+    let restored = false;
     if (res[CALIB_KEY]) {
-      try {
-        const c = res[CALIB_KEY];
-        if (Array.isArray(c.corners)) state.corners = c.corners;
-        if (Array.isArray(c.pockets)) state.pockets = c.pockets;
-        if (typeof c.ballRadius === 'number') state.ballRadius = c.ballRadius;
-        if (c.ballRadiusManual === true) state.ballRadiusManual = true;
-      } catch (e) { /* ignore */ }
+      try { restored = applyCalib(res[CALIB_KEY]); } catch (e) { /* ignore */ }
+    }
+    // Extension storage empty (first install / reinstall) — try to recover
+    // from the page's localStorage, which survives extension uninstall.
+    if (!restored) {
+      const lsCalib = readLocalStorageCalib();
+      if (lsCalib && applyCalib(lsCalib)) {
+        // Also push it back into chrome.storage.local so the fast path works
+        chrome.storage.local.set({ [CALIB_KEY]: lsCalib });
+      }
     }
     if (res[STORAGE_KEY]) {
       state.enabled = true;
@@ -423,7 +454,13 @@
         if (!state.gameCanvas) { tryMountOverlay(false); }
         if (!state.gameCanvas) return setHint('Canvas do jogo nao encontrado. Clique "Achar jogo".');
         chrome.storage.local.get([CALIB_KEY], (res) => {
-          const c = res && res[CALIB_KEY];
+          let c = res && res[CALIB_KEY];
+          // Fallback: maybe the extension was just reinstalled, so
+          // chrome.storage is empty but the page localStorage still has
+          // our previously-saved calibration.
+          if (!c || !Array.isArray(c.corners) || c.corners.length !== 4) {
+            c = readLocalStorageCalib();
+          }
           if (!c || !Array.isArray(c.corners) || c.corners.length !== 4) {
             setHint('Nenhuma calibragem anterior encontrada. Use "Calibrar" uma vez.');
             return;
@@ -442,6 +479,8 @@
             }
           }
           if (c.ballRadiusManual === true) state.ballRadiusManual = true;
+          // Re-sync everything to storage in case we pulled from localStorage
+          saveCalibration();
           state.mode = 'idle';
           enableInteractive(false);
           setHint('Calibragem anterior carregada! Iniciando detecção de bolas...');
@@ -643,14 +682,19 @@
   }
 
   function saveCalibration() {
-    chrome.storage.local.set({
-      [CALIB_KEY]: {
-        corners: state.corners,
-        pockets: state.pockets,
-        ballRadius: state.ballRadius,
-        ballRadiusManual: state.ballRadiusManual,
-      },
-    });
+    const calib = {
+      corners: state.corners,
+      pockets: state.pockets,
+      ballRadius: state.ballRadius,
+      ballRadiusManual: state.ballRadiusManual,
+    };
+    chrome.storage.local.set({ [CALIB_KEY]: calib });
+    // Mirror to page localStorage: survives extension uninstall so the
+    // user does NOT have to recalibrate when reinstalling the extension
+    // on the same domain (sinucada.com).
+    if (Array.isArray(state.corners) && state.corners.length === 4) {
+      writeLocalStorageCalib(calib);
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -954,18 +998,27 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Cue stick detection (PCA-based)                                    */
-  /*   1. Collect non-felt pixels near the cue ball, within the table   */
-  /*      polygon PLUS a rail margin (so we see the stick body that     */
-  /*      hangs over the cushions).                                     */
-  /*   2. Fit a line through the pixel cluster using Principal          */
-  /*      Component Analysis. The dominant eigenvector of the 2x2       */
-  /*      covariance matrix is the cue stick's axis — this is robust to */
-  /*      scattered noise pixels which don't align with the axis.       */
-  /*   3. Require elongation (lambda1/lambda2 > 2) to confirm it's      */
-  /*      actually a stick-shaped cluster, not a blob.                  */
-  /*   4. Use the sign of (cueBall - CoM) projected on the axis to pick */
-  /*      the correct direction (toward the stick tip, away from butt). */
+  /* Cue stick detection (Angular Histogram)                            */
+  /*                                                                    */
+  /* Per-frame pipeline (robust to ball halos + UI clutter):            */
+  /*  1. Collect non-felt pixels around the cue ball (inside polygon +  */
+  /*     rail margin).                                                  */
+  /*  2. Aggressive ball masking (1.9 R) so stray pixels from nearby    */
+  /*     striped/colored balls do not contaminate the vote.             */
+  /*  3. For every surviving pixel compute its ANGLE relative to the    */
+  /*     cue ball and add its DISTANCE to the angle-bin. Far pixels     */
+  /*     (definitively stick, not ball rim) weigh more than near ones.  */
+  /*  4. Smooth the 72-bin histogram (5 deg each) with a 5-tap kernel,  */
+  /*     find the peak bin — that is the butt direction.                */
+  /*  5. Safety checks: clear peak vs. noise floor AND the peak bin     */
+  /*     must contain at least one pixel at distance >= 3R (real stick).*/
+  /*  6. Shot direction = opposite of butt direction.                   */
+  /*                                                                    */
+  /* Why this is more robust than PCA: ball-halo pixels scatter across  */
+  /* many angles around the cue ball, so they spread across bins; the   */
+  /* actual cue stick pixels all sit in 1-2 adjacent bins so they       */
+  /* dominate the peak. PCA can be flipped 90° when a large ball        */
+  /* cluster has more pixels than the stick.                            */
   /* ------------------------------------------------------------------ */
   function distToPolySq(x, y, poly) {
     let minD2 = Infinity;
@@ -989,12 +1042,12 @@
   function detectCueStick(data, W, H, balls) {
     const cue = state.cueBall;
     const R = state.ballRadius;
-    // Bigger search window again: we now allow pixels beyond the polygon
-    // so the stick butt (outside the table over the rail) contributes.
-    const searchR = Math.max(160, R * 14);
-    const excludeR = R * 1.7; // mask the cue ball + its immediate halo
-    const ballExcludeR = R * 1.3; // mask other balls
-    const RAIL_MARGIN = Math.max(40, Math.round(R * 4)); // allow this many px outside polygon
+    const searchR = Math.max(180, R * 14);
+    const excludeR = R * 1.7;
+    // Bumped from 1.3 to 1.9: aggressive ball masking so adjacent ball
+    // rims don't contribute noise pixels that skew the direction vote.
+    const ballExcludeR = R * 1.9;
+    const RAIL_MARGIN = Math.max(50, Math.round(R * 4));
     const RAIL_MARGIN2 = RAIL_MARGIN * RAIL_MARGIN;
 
     const xMin = Math.max(0, Math.floor(cue.x - searchR));
@@ -1006,10 +1059,12 @@
     const poly = state.corners;
     const havePoly = poly.length === 4;
 
-    // Running sums for PCA (single-pass, no arrays needed).
-    let sumX = 0, sumY = 0;
-    let sumXX = 0, sumYY = 0, sumXY = 0;
-    let count = 0;
+    const N_BINS = 72;       // 5-degree bins
+    const TWO_PI = Math.PI * 2;
+    const binWeight = new Float32Array(N_BINS); // distance-weighted sum
+    const binFarDist = new Float32Array(N_BINS); // max distance in this bin
+    let totalPixels = 0;
+    let totalWeight = 0;
 
     const r2 = searchR * searchR;
     const ex2 = excludeR * excludeR;
@@ -1022,16 +1077,11 @@
         if (d2 > r2) continue;
         if (d2 < ex2) continue;
 
-        // Polygon filter with rail margin. Inside polygon -> accept.
-        // Outside polygon but within RAIL_MARGIN of an edge -> accept
-        // (captures cue stick butt that hangs over the rails).
-        // Further out -> reject (filters side panel, chat, scoreboard).
+        // Polygon filter with rail margin.
         let inside = true;
         if (havePoly) {
           inside = pointInPoly(x, y, poly);
-          if (!inside) {
-            if (distToPolySq(x, y, poly) > RAIL_MARGIN2) continue;
-          }
+          if (!inside && distToPolySq(x, y, poly) > RAIL_MARGIN2) continue;
         }
 
         const i = (y * W + x) * 4;
@@ -1040,8 +1090,7 @@
         // Not felt: green dominance
         if (g > r + 12 && g > b + 12 && g > 40) continue;
 
-        // Brightness filter. Stricter outside the polygon to reject the
-        // dark side panel (#21262d ~ 116), chat backgrounds, etc.
+        // Brightness filter. Stricter outside the polygon.
         const bright = r + g + b;
         if (inside) {
           if (bright < 90) continue;
@@ -1049,7 +1098,7 @@
           if (bright < 150) continue;
         }
 
-        // Skip any ball area
+        // Skip ball halos
         let inBall = false;
         for (let k = 0; k < ballsArr.length; k++) {
           const bb = ballsArr[k];
@@ -1059,73 +1108,87 @@
         }
         if (inBall) continue;
 
-        // Accumulate for PCA
-        sumX += x; sumY += y;
-        sumXX += x * x; sumYY += y * y; sumXY += x * y;
-        count++;
+        // Vote into the angular histogram, weighted by distance
+        const d = Math.sqrt(d2);
+        let ang = Math.atan2(ddy, ddx); // [-PI, PI]
+        if (ang < 0) ang += TWO_PI;     // [0, 2PI)
+        const binIdx = Math.min(N_BINS - 1, Math.floor(ang / TWO_PI * N_BINS));
+        binWeight[binIdx] += d;
+        if (d > binFarDist[binIdx]) binFarDist[binIdx] = d;
+        totalPixels++;
+        totalWeight += d;
       }
     }
 
-    if (count < 60) {
+    if (totalPixels < 60) {
       state.cueStick = null;
       return;
     }
 
-    const cmx = sumX / count, cmy = sumY / count;
-    // Covariance (central moments)
-    const Sxx = sumXX / count - cmx * cmx;
-    const Syy = sumYY / count - cmy * cmy;
-    const Sxy = sumXY / count - cmx * cmy;
+    // 5-tap smoothing (handles pixels that land exactly on a bin boundary)
+    // and find peak.
+    let peakBin = 0, peakSmooth = -1;
+    for (let i = 0; i < N_BINS; i++) {
+      const a = binWeight[(i - 2 + N_BINS) % N_BINS] * 0.3;
+      const b = binWeight[(i - 1 + N_BINS) % N_BINS] * 0.7;
+      const c = binWeight[i];
+      const d = binWeight[(i + 1) % N_BINS] * 0.7;
+      const e = binWeight[(i + 2) % N_BINS] * 0.3;
+      const s = a + b + c + d + e;
+      if (s > peakSmooth) { peakSmooth = s; peakBin = i; }
+    }
 
-    // Eigenvalues of [[Sxx,Sxy],[Sxy,Syy]]
-    const tr = Sxx + Syy;
-    const disc = Math.max(0, (tr * tr) / 4 - (Sxx * Syy - Sxy * Sxy));
-    const sqrtDisc = Math.sqrt(disc);
-    const lambda1 = tr / 2 + sqrtDisc; // principal (stick axis) variance
-    const lambda2 = Math.max(0.0001, tr / 2 - sqrtDisc); // perpendicular variance
-
-    // Shape check: stick must be elongated. Ratio < 2 -> blob-like, drop.
-    const elongation = lambda1 / lambda2;
-    if (elongation < 2.0) {
+    // Contrast check: peak must stand out clearly over noise floor.
+    // Smoothing kernel sums to 3.0 of a bin's weight; random noise yields
+    // about avgBin*3.0, so require the peak to be >= 1.8x the expected
+    // noise level.
+    const avgBin = totalWeight / N_BINS;
+    const noiseExpected = avgBin * 3.0;
+    if (peakSmooth < noiseExpected * 1.8) {
       state.cueStick = null;
       return;
     }
 
-    // Eigenvector for lambda1 (principal axis direction)
-    let vx, vy;
-    if (Math.abs(Sxy) > 1e-6) {
-      vx = lambda1 - Syy;
-      vy = Sxy;
-    } else if (Sxx >= Syy) {
-      vx = 1; vy = 0;
-    } else {
-      vx = 0; vy = 1;
-    }
-    const n = Math.hypot(vx, vy) || 1;
-    vx /= n; vy /= n;
-
-    // Orient the axis so it points FROM the stick body TOWARD the cue ball
-    // (i.e. the shot direction). Project (cue - cm) onto v: if positive, v
-    // already points toward the ball; else flip.
-    const proj = (cue.x - cmx) * vx + (cue.y - cmy) * vy;
-    if (proj < 0) { vx = -vx; vy = -vy; }
-
-    // Sanity: CoM must be meaningfully offset from the cue ball, otherwise
-    // the direction is noise (e.g. tiny fragment of stick visible).
-    const cmDist = Math.hypot(cue.x - cmx, cue.y - cmy);
-    if (cmDist < R * 0.4) {
+    // The stick must also be LONG: need at least one pixel far from the
+    // cue ball in the peak direction (and the 2 adjacent bins, to tolerate
+    // pixels landing at a bin boundary).
+    const farInPeak = Math.max(
+      binFarDist[peakBin],
+      binFarDist[(peakBin - 1 + N_BINS) % N_BINS],
+      binFarDist[(peakBin + 1) % N_BINS],
+    );
+    if (farInPeak < R * 3) {
       state.cueStick = null;
       return;
     }
+
+    // Parabolic interpolation around the peak for sub-bin resolution.
+    const yM1 = binWeight[(peakBin - 1 + N_BINS) % N_BINS];
+    const y0  = binWeight[peakBin];
+    const yP1 = binWeight[(peakBin + 1) % N_BINS];
+    const denom = (yM1 - 2 * y0 + yP1);
+    const offset = Math.abs(denom) > 1e-6 ? 0.5 * (yM1 - yP1) / denom : 0;
+    const refinedBin = peakBin + offset;
+    const buttAngle = ((refinedBin + 0.5) / N_BINS) * TWO_PI;
+    const buttDX = Math.cos(buttAngle);
+    const buttDY = Math.sin(buttAngle);
+
+    // Shot direction = opposite of butt direction (the ball goes away
+    // from the stick body).
+    const shotDX = -buttDX;
+    const shotDY = -buttDY;
 
     state.cueStick = {
-      cmx, cmy,
-      dx: vx, dy: vy,
-      count,
-      farX: cmx, farY: cmy, // kept for backwards compat with renderer
-      elongation,
+      cmx: cue.x + buttDX * farInPeak * 0.5,
+      cmy: cue.y + buttDY * farInPeak * 0.5,
+      dx: shotDX,
+      dy: shotDY,
+      count: totalPixels,
+      farX: cue.x + buttDX * farInPeak,
+      farY: cue.y + buttDY * farInPeak,
+      peakRatio: peakSmooth / (noiseExpected || 1),
     };
-    // If no manual target ball, auto-pick the ball the cue is aiming at.
+
     autoPickTargetAlongCue();
   }
 
