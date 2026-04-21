@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "Sinucada Aim Helper",
+  "version": "1.0.0",
+  "description": "Auxiliar de mira (ghost ball) para estudo de geometria/fisica em partidas de treino na Sinucada.",
+  "default_locale": "pt_BR",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://sinucada.com/*",
+    "https://*.sinucada.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Sinucada Aim Helper",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://sinucada.com/*",
+        "https://*.sinucada.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://sinucada.com/*",
+        "https://*.sinucada.com/*"
+      ],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["https://sinucada.com/*", "https://*.sinucada.com/*"]
+    }
+  ]
+}
